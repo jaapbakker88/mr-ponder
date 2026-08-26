@@ -1,0 +1,16 @@
+{
+  "name": "mr-ponder",
+  "version": "0.1.0",
+  "description": "git add -p, but for reviewing an existing GitLab MR: step through hunks risk-first and attach private notes/tags/links.",
+  "type": "module",
+  "bin": {
+    "mrp": "./mrp.mjs"
+  },
+  "scripts": {
+    "start": "node mrp.mjs"
+  },
+  "dependencies": {
+    "ink": "^5.1.0",
+    "react": "^18.3.1"
+  }
+}
