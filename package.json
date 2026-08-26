@@ -7,7 +7,8 @@
     "mrp": "./mrp.mjs"
   },
   "scripts": {
-    "start": "node mrp.mjs"
+    "start": "node mrp.mjs",
+    "test": "node --test"
   },
   "dependencies": {
     "ink": "^5.1.0",

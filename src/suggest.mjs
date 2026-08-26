@@ -10,19 +10,9 @@
 // import-edges are precomputed once per session (they need the local repo to
 // read each changed file's own import list).
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-
-const execFileP = promisify(execFile);
-
-// app/src/services/utils.ts -> @/services/utils
-function importSpec(path) {
-  const m = path.match(/(?:^|\/)app\/src\/(.+)$/) || path.match(/^src\/(.+)$/);
-  if (!m) return null;
-  return "@/" + m[1].replace(/\.(tsx?|jsx?)$/, "").replace(/\/index$/, "");
-}
+import { importSpec } from "./paths.mjs";
 
 // Read the @/ specifiers a given repo file imports (best-effort). Prefer the
 // local checkout (complete import list), but the MR branch may not be checked
