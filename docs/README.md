@@ -1,5 +1,15 @@
 # mr-ponder (`mrp`)
 
+> **Vision** — reviewing large, AI-assisted code-change MRs should be tractable
+> for the human in the loop, not a war of attrition against line count.
+>
+> **Mission** — help the reviewer *make connections* and *see issues* across a
+> big change without slogging through the whole diff line by line.
+>
+> **Goal** — surface the risky and related parts first, and give the reviewer a
+> private space to connect the dots, so understanding comes from structure and
+> relationships rather than sequential reading.
+
 `git add -p`, but for **reviewing** an existing GitLab merge request instead of
 staging changes. Step through a MR's diff hunk-by-hunk — risk-first — and attach
 **private** notes, tags, and chunk-to-chunk links so you can connect the dots
