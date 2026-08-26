@@ -91,9 +91,14 @@ export function reconcile(state, headSha, fetchedAt, chunkIds) {
 }
 
 // ---- mutation helpers (each returns the mutated state; caller saves) ----
-export function addNote(state, chunkId, text) {
+// `range` (optional) anchors an annotation to specific new-file lines within the
+// chunk: { start, end } inclusive, new-side line numbers. Absent/null = the whole
+// chunk (legacy behavior — still fully supported).
+export function addNote(state, chunkId, text, range = null) {
   if (!text || !text.trim()) return state;
-  (state.notes[chunkId] ||= []).push({ text: text.trim(), at: new Date().toISOString() });
+  const note = { text: text.trim(), at: new Date().toISOString() };
+  if (range) note.range = range;
+  (state.notes[chunkId] ||= []).push(note);
   return state;
 }
 
@@ -112,19 +117,30 @@ export function markEngaged(state, chunkId) {
   return state;
 }
 
-export function addTag(state, chunkId, tag) {
+export function addTag(state, chunkId, tag, range = null) {
   const t = (tag || "").trim().replace(/^#/, "");
   if (!t) return state;
+  // Chunk-level tags stay a flat string list (back-compat). A ranged tag is
+  // stored as an object so it can carry its line span without breaking the
+  // "already has this tag" de-dup for the plain case.
   const list = (state.tags[chunkId] ||= []);
-  if (!list.includes(t)) list.push(t);
+  if (range) {
+    const exists = list.some((x) => typeof x === "object" && x.tag === t && x.range?.start === range.start && x.range?.end === range.end);
+    if (!exists) list.push({ tag: t, range });
+  } else if (!list.some((x) => (typeof x === "object" ? x.tag : x) === t)) {
+    list.push(t);
+  }
   return state;
 }
 
-export function addLink(state, from, to, label) {
+export function addLink(state, from, to, label, range = null) {
   if (!from || !to || from === to) return state;
   const exists = state.links.some((l) => l.from === from && l.to === to);
-  if (!exists)
-    state.links.push({ from, to, label: (label || "").trim(), at: new Date().toISOString() });
+  if (!exists) {
+    const link = { from, to, label: (label || "").trim(), at: new Date().toISOString() };
+    if (range) link.range = range;
+    state.links.push(link);
+  }
   return state;
 }
 
@@ -143,4 +159,14 @@ export function markNotePromoted(state, chunkId, noteIndex, meta) {
 
 export function linksFor(state, chunkId) {
   return state.links.filter((l) => l.from === chunkId || l.to === chunkId);
+}
+
+// A tag entry is either a bare string (chunk-level, legacy) or { tag, range }
+// (line-anchored). These two readers are the single place that knows the union
+// shape — every consumer goes through them so the string|object split can't leak.
+export function tagName(t) {
+  return typeof t === "object" && t ? t.tag : t;
+}
+export function tagRange(t) {
+  return typeof t === "object" && t ? t.range || null : null;
 }

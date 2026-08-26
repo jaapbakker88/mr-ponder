@@ -23,16 +23,20 @@
 import React, { useState, useMemo, useEffect } from "react";
 import { Box, Text, useInput, useApp, useStdout } from "ink";
 import { spawnSync } from "node:child_process";
-import { writeFileSync, readFileSync, unlinkSync, mkdtempSync } from "node:fs";
+import { writeFileSync, readFileSync, unlinkSync, mkdtempSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { saveState, addNote, toggleSeen, addTag, addLink, linksFor, markEngaged, markNotePromoted } from "./store.mjs";
+import { saveState, addNote, toggleSeen, addTag, addLink, linksFor, markEngaged, markNotePromoted, tagName, tagRange } from "./store.mjs";
 import { suggestLinks } from "./suggest.mjs";
-import { orderChunks } from "./risk.mjs";
+import { orderChunks, riskGlyph, riskColor, sidebarRowIndex, computeSidebarWindow } from "./risk.mjs";
 import { buildPosition, postDiffNote } from "./gitlab.mjs";
 
 const h = React.createElement;
-const SIDEBAR_W = 36;
+// Sidebar width scales with the terminal so file names get more room on wide
+// screens, clamped so it never starves the hunk pane (narrow) or wastes space
+// (ultra-wide). Actual width computed per-render from `cols` as `sidebarW`.
+const SIDEBAR_MIN = 34;
+const SIDEBAR_MAX = 52;
 
 // Marker prefix for scaffold/instruction lines seeded into the editor buffer.
 // Only these are stripped from the returned text — so a user's own '#' lines
@@ -101,9 +105,23 @@ function withLineNumbers(chunk) {
 // when git emitted no context snippet (so a row is never just a bare number).
 function chunkLabel(c) {
   const loc = c.newStart ? `L${c.newStart}` : "·";
+  // Metadata-only moves (pure rename/delete/add) have no useful line/context —
+  // show a compact operation tag instead of a bare "·".
+  if (c.metaOnly || (c.op && !c.added && !c.removed)) {
+    const tag = { renamed: "renamed", deleted: "deleted", added: "added" }[c.op] || c.op;
+    return tag;
+  }
+  const opPrefix = c.op ? `${{ renamed: "R", deleted: "D", added: "A" }[c.op] || "?"} ` : "";
   const ctx = (c.context || "").replace(/^(export\s+)?(async\s+)?(function|const|class)\s+/, "").trim();
-  if (ctx) return `${loc} ${ctx}`;
-  return `${loc} (+${c.added}/-${c.removed})`;
+  if (ctx) return `${opPrefix}${loc} ${ctx}`;
+  return `${opPrefix}${loc} (+${c.added}/-${c.removed})`;
+}
+
+// " L12" for a single line, " L12-18" for a span, "" when chunk-level. Shared by
+// the note/tag/link renderers so a line-anchored annotation shows its span.
+function fmtRange(r) {
+  if (!r) return "";
+  return r.start === r.end ? ` L${r.start}` : ` L${r.start}-${r.end}`;
 }
 
 export default function App({ initialState, chunks, detail, importEdges }) {
@@ -122,9 +140,13 @@ export default function App({ initialState, chunks, detail, importEdges }) {
   const [suggestions, setSuggestions] = useState([]);
   const [linkArmed, setLinkArmed] = useState(null);
   const [help, setHelp] = useState(false);
+  const [importersOpen, setImportersOpen] = useState(false); // importer-locations overlay
   const [flash, setFlash] = useState("");
   const [focus, setFocus] = useState("sidebar"); // sidebar | hunk
   const [scroll, setScroll] = useState(0); // hunk-body scroll offset (lines)
+  const [lineCur, setLineCur] = useState(0); // cursor line within the hunk body (index into numbered[])
+  const [selAnchor, setSelAnchor] = useState(null); // visual-select start index, or null
+  const [pendingRange, setPendingRange] = useState(null); // range captured when a tag/link flow began
   const [confirmPromote, setConfirmPromote] = useState(false); // awaiting y/Esc to post
   const undoStack = React.useRef([]); // deep snapshots of state before each mutation
 
@@ -185,7 +207,7 @@ export default function App({ initialState, chunks, detail, importEdges }) {
       const q = filter.toLowerCase();
       list = list.filter((c) => {
         const notes = (state.notes[c.id] || []).map((n) => n.text).join(" ");
-        const tags = (state.tags[c.id] || []).join(" ");
+        const tags = (state.tags[c.id] || []).map(tagName).join(" ");
         return (
           c.file.toLowerCase().includes(q) ||
           (c.context || "").toLowerCase().includes(q) ||
@@ -258,31 +280,138 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     flashMsg("no annotated chunks");
   };
 
-  // Terminal size + how many hunk-body lines fit at once (used by scroll math
-  // in the input handler AND the render below, so compute it once here).
+  // Terminal size. Re-read live on every render AND subscribe to 'resize' so a
+  // stale size at mount (e.g. the alt-screen switch not settled, or a pty that
+  // reports the wrong rows initially) self-corrects — otherwise the sidebar can
+  // render far more rows than the terminal has and Ink repaints garbage
+  // ("jumping around"). `sizeTick` forces a re-render when the terminal resizes.
+  const [, setSizeTick] = useState(0);
+  useEffect(() => {
+    if (!stdout || typeof stdout.on !== "function") return;
+    const onResize = () => setSizeTick((n) => n + 1);
+    stdout.on("resize", onResize);
+    return () => stdout.off?.("resize", onResize);
+  }, [stdout]);
   const cols = (stdout && stdout.columns) || 120;
   const rows = (stdout && stdout.rows) || 32;
-  const paneW = Math.max(40, cols - SIDEBAR_W - 3);
-  const bodyH = Math.max(6, rows - 14); // visible hunk lines
+  // Render ONE line short of the terminal height (see the return below): Ink's
+  // trailing newline would otherwise force a scroll and desync repaints on tall
+  // frames. All height budgets derive from `appH`, not raw `rows`.
+  const appH = Math.max(4, rows - 1);
+  // ~42% of the terminal for the map, clamped — wide enough to read file paths,
+  // never so wide it crowds the diff.
+  const sidebarW = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, Math.floor(cols * 0.36)));
+  // Usable text columns INSIDE the sidebar box: minus 2 border + 2 padding, then a
+  // 1-col safety margin so a row can never reach the exact wrap threshold (a
+  // full-width row wraps to a 2nd line on some terminals and desyncs every row
+  // below it — the header/chunk misalignment seen on WezTerm). Every sidebar
+  // slice is measured against this, never against sidebarW directly.
+  const sidebarInner = Math.max(8, sidebarW - 5);
+  const paneW = Math.max(40, cols - sidebarW - 3);
+  const bodyH = Math.max(6, appH - 13); // visible hunk lines
   const bodyLen = chunk ? chunk.body.length : 0;
   const maxScroll = Math.max(0, bodyLen - bodyH);
+
+  // The hunk body with per-line new-file numbers — computed once here because the
+  // input handler (range math) and the render (highlight) both need it.
+  const numbered = useMemo(() => (chunk ? withLineNumbers(chunk) : []), [chunk && chunk.id]);
+
+  // Translate a body-index span [a,b] into a new-file line range { start, end }.
+  // Lines without a new-file number (removed lines, @@ header) are skipped; if the
+  // span covers only such lines we fall back to null (→ chunk-level annotation).
+  const rangeFromSel = (a, b) => {
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    const nums = numbered.slice(lo, hi + 1).map((r) => r.num).filter((n) => n != null);
+    if (!nums.length) return null;
+    return { start: Math.min(...nums), end: Math.max(...nums) };
+  };
+
+  // The range to attach to a new annotation:
+  //   • a visual selection when one is armed (`v`) → its full span;
+  //   • otherwise, when the hunk pane is focused, the cursor's single line so a
+  //     plain `n`/`t`/`l` while reading still records WHERE it applies;
+  //   • sidebar focus → null (chunk-level — the note isn't tied to one line).
+  const activeRange = () => {
+    if (focus !== "hunk") return null;
+    if (selAnchor != null) return rangeFromSel(selAnchor, lineCur);
+    return rangeFromSel(lineCur, lineCur);
+  };
+  const clearSel = () => setSelAnchor(null);
 
   // Honest engagement: a chunk is "engaged" once its full body has been shown —
   // the bottom line is on screen (trivially true when the hunk fits, or after the
   // reviewer scrolls a long hunk to the end). One-way; observed, not self-reported.
   // Gated to view/hunk modes so text-entry/help/link flows don't trip it.
   const bottomVisible = chunk && Math.min(scroll, maxScroll) >= maxScroll;
+  //
+  // This was a `useEffect` calling `persist(...)` (setState) keyed on chunk.id/
+  // bottomVisible — same double-commit problem as the lineCur/selAnchor reset
+  // above, but INDEPENDENT of it: fixing that one didn't fix this one, which is
+  // why the render count didn't actually drop (verified via MRP_DEBUG: still 2
+  // renders/keystroke). Most of the the reference MR <Feature> chunks are
+  // tiny single-hunk adds, so `bottomVisible` is true immediately on landing —
+  // this effect fired on nearly every keystroke through that whole region.
+  // Marking engaged during render (same pattern as above) folds the state
+  // change into the same commit. The disk write is genuinely a side effect
+  // (unlike the pure state reset above), so it stays in a `useEffect` — but
+  // that effect only does I/O and never calls setState, so it cannot trigger
+  // a further render/repaint. `persist()` is left untouched for every other
+  // (user-keystroke-driven) mutation in this file; this is a narrow bypass
+  // just for the reactive auto-engagement path.
+  const autoEngageDirty = React.useRef(false);
+  if (chunk && mode === "view" && !help && bottomVisible && !state.engaged?.[chunk.id]) {
+    autoEngageDirty.current = true;
+    setState((prev) => {
+      const next = structuredClone(prev);
+      markEngaged(next, chunk.id);
+      return next;
+    });
+  }
   useEffect(() => {
-    if (!chunk) return;
-    if (mode !== "view" || help) return;
-    if (!bottomVisible) return;
-    if (state.engaged?.[chunk.id]) return;
-    persist((s) => markEngaged(s, chunk.id));
-  }, [chunk && chunk.id, bottomVisible, mode, help]);
+    if (autoEngageDirty.current) {
+      autoEngageDirty.current = false;
+      saveState(state);
+    }
+  }, [state]);
 
   const moveChunk = (delta) => {
     setIdx((i) => Math.min(Math.max(i + delta, 0), visible.length - 1));
     setScroll(0); // new chunk starts at the top of its diff
+  };
+
+  // A new chunk starts with the line cursor at the top and no visual selection —
+  // a range must never bleed across chunks. This used to be a `useEffect` keyed
+  // on chunk.id, but that fires as a SEPARATE commit after the one that moved
+  // `idx` — i.e. every arrow-key press produced two full Ink repaints of the
+  // ~sidebarH-row frame, ~20-50ms apart (confirmed via MRP_DEBUG trace: every
+  // keystroke logged two identical render frames). Two near-simultaneous
+  // full-height repaints are the prime suspect for the WezTerm sidebar
+  // corruption (see docs/BUG-sidebar-file-order-corruption.md) — Ink's
+  // log-update writer trusts its own erased-line bookkeeping and never
+  // re-verifies the terminal applied a write, so a torn/coalesced repaint from
+  // a rapid double-write can leave stale content on screen permanently.
+  // Resetting during render (React's "adjust state while rendering" pattern)
+  // folds this into the SAME commit as the idx change, so each keystroke
+  // produces exactly one Ink repaint instead of two.
+  const [resetForChunkId, setResetForChunkId] = useState(chunk && chunk.id);
+  if ((chunk && chunk.id) !== resetForChunkId) {
+    setResetForChunkId(chunk && chunk.id);
+    setLineCur(0);
+    setSelAnchor(null);
+  }
+
+  // Move the hunk line cursor by `delta`, clamped to the body, and scroll just
+  // enough to keep the cursor on screen (cursor-follows-view, like a pager).
+  const moveLine = (delta) => {
+    setLineCur((prev) => {
+      const next = Math.min(Math.max(prev + delta, 0), Math.max(0, bodyLen - 1));
+      setScroll((s) => {
+        if (next < s) return next; // cursor above viewport → scroll up to it
+        if (next > s + bodyH - 1) return Math.min(next - bodyH + 1, maxScroll); // below → down
+        return Math.min(s, maxScroll);
+      });
+      return next;
+    });
   };
 
   useInput((input, key) => {
@@ -299,6 +428,14 @@ export default function App({ initialState, chunks, detail, importEdges }) {
       return;
     }
 
+    // Esc closes the importers panel (when nothing else claims Esc). The panel is
+    // NOT a modal — normal navigation keeps working while it's open; only `i` and
+    // Esc toggle it, handled here / in the `i` key below.
+    if (importersOpen && key.escape && selAnchor == null && mode === "view") {
+      setImportersOpen(false);
+      return;
+    }
+
     // Tab always toggles which pane the arrow/jk keys drive.
     if (key.tab) {
       setFocus((f) => (f === "sidebar" ? "hunk" : "sidebar"));
@@ -309,8 +446,10 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     if (mode === "tag" || mode === "search") {
       if (key.return) {
         if (mode === "tag" && chunk) {
-          persist((s) => addTag(s, chunk.id, buffer));
-          flashMsg(`tagged #${buffer.replace(/^#/, "")}`);
+          persist((s) => addTag(s, chunk.id, buffer, pendingRange));
+          flashMsg(`tagged #${buffer.replace(/^#/, "")}${pendingRange ? " (line-anchored)" : ""}`);
+          setPendingRange(null);
+          setSelAnchor(null);
         }
         if (mode === "search") { setFilter(buffer); setIdx(0); setScroll(0); }
         setBuffer("");
@@ -320,6 +459,7 @@ export default function App({ initialState, chunks, detail, importEdges }) {
       if (key.escape) {
         setBuffer("");
         setMode("view");
+        setPendingRange(null);
         if (mode === "search") { setFilter(""); setIdx(0); setScroll(0); }
         return;
       }
@@ -333,11 +473,14 @@ export default function App({ initialState, chunks, detail, importEdges }) {
       if (key.escape) {
         setMode("view");
         setSuggestions([]);
+        setPendingRange(null);
         flashMsg("link cancelled");
         return;
       }
       if (input === "f") {
-        // free-pick: leave suggest mode, arm a manual target pick
+        // free-pick: leave suggest mode, arm a manual target pick. Remember the
+        // source chunk AND keep the captured range for the eventual link.
+        setLinkArmed(chunk.id);
         setMode("freepick");
         flashMsg("free-pick: navigate to target, Enter to link (Esc cancels)");
         return;
@@ -345,11 +488,14 @@ export default function App({ initialState, chunks, detail, importEdges }) {
       const n = parseInt(input, 10);
       if (n >= 1 && n <= suggestions.length) {
         const target = suggestions[n - 1].chunk;
+        const range = pendingRange;
         const label = editorPrompt(`${SCAFFOLD} how are these related?\n`);
-        persist((s) => addLink(s, chunk.id, target.id, label));
+        persist((s) => addLink(s, chunk.id, target.id, label, range));
         setMode("view");
         setSuggestions([]);
-        flashMsg("linked");
+        setPendingRange(null);
+        setSelAnchor(null);
+        flashMsg(range ? "linked (line-anchored)" : "linked");
       }
       return;
     }
@@ -361,15 +507,19 @@ export default function App({ initialState, chunks, detail, importEdges }) {
       if (key.escape) {
         setMode("view");
         setLinkArmed(null);
+        setPendingRange(null);
         flashMsg("link cancelled");
         return;
       }
       if (key.return && chunk && linkArmed && chunk.id !== linkArmed) {
+        const range = pendingRange;
         const label = editorPrompt(`${SCAFFOLD} how are these related?\n`);
-        persist((s) => addLink(s, linkArmed, chunk.id, label));
+        persist((s) => addLink(s, linkArmed, chunk.id, label, range));
         setMode("view");
         setLinkArmed(null);
-        flashMsg("linked");
+        setPendingRange(null);
+        setSelAnchor(null);
+        flashMsg(range ? "linked (line-anchored)" : "linked");
         return;
       }
       // Allow only movement keys through to the navigation handler below;
@@ -392,24 +542,34 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     if (lc === "q") return exit();
     if (input === "?") return setHelp((v) => !v);
     // j/k (and arrows) drive whichever pane has focus: sidebar = move between
-    // chunks; hunk = scroll the diff body. Tab toggles focus.
+    // chunks; hunk = move the line cursor (scroll follows). Tab toggles focus.
     if (key.downArrow || lc === "j") {
-      if (focus === "hunk") setScroll((s) => Math.min(s + 1, maxScroll));
+      if (focus === "hunk") moveLine(1);
       else moveChunk(1);
     } else if (key.upArrow || lc === "k") {
-      if (focus === "hunk") setScroll((s) => Math.max(s - 1, 0));
+      if (focus === "hunk") moveLine(-1);
       else moveChunk(-1);
     } else if (key.pageDown || (key.ctrl && lc === "d")) {
-      setScroll((s) => Math.min(s + bodyH, maxScroll));
+      if (focus === "hunk") moveLine(bodyH);
+      else setScroll((s) => Math.min(s + bodyH, maxScroll));
     } else if (key.pageUp || (key.ctrl && lc === "u")) {
-      setScroll((s) => Math.max(s - bodyH, 0));
+      if (focus === "hunk") moveLine(-bodyH);
+      else setScroll((s) => Math.max(s - bodyH, 0));
     } else if (input === "[") jumpFile(-1);
     else if (input === "]") jumpFile(1);
     else if (input === "}") jumpAnnotated(1);
     else if (input === "{") jumpAnnotated(-1);
     // g/G are case-SIGNIFICANT (top vs bottom) — matched on raw input.
-    else if (input === "g") { if (focus === "hunk") setScroll(0); else moveChunk(-visible.length); }
-    else if (input === "G") { if (focus === "hunk") setScroll(maxScroll); else moveChunk(visible.length); }
+    else if (input === "g") { if (focus === "hunk") moveLine(-bodyLen); else moveChunk(-visible.length); }
+    else if (input === "G") { if (focus === "hunk") moveLine(bodyLen); else moveChunk(visible.length); }
+    // v — toggle a visual line selection in the hunk pane. Arms an anchor at the
+    // cursor; move to extend; a subsequent note/tag/link attaches to the span.
+    else if (lc === "v") {
+      if (focus !== "hunk") { setFocus("hunk"); setSelAnchor(lineCur); flashMsg("visual: move to extend, n/t/l to annotate, Esc/v to clear"); }
+      else if (selAnchor == null) { setSelAnchor(lineCur); flashMsg("visual: move to extend, n/t/l to annotate, Esc/v to clear"); }
+      else { setSelAnchor(null); flashMsg("selection cleared"); }
+    }
+    else if (key.escape && selAnchor != null) { setSelAnchor(null); flashMsg("selection cleared"); }
     else if (input === " ") { if (chunk) persist((s) => toggleSeen(s, chunk.id)); }
     // P (capital, deliberate) — promote a note to a GitLab comment. Leaves the laptop.
     else if (input === "P") {
@@ -420,14 +580,17 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     }
     else if (lc === "n") {
       if (chunk) {
-        const text = editorPrompt(`${SCAFFOLD} note on ${chunk.file}\n${SCAFFOLD} ${chunk.context}\n\n`);
-        if (text) { persist((s) => addNote(s, chunk.id, text)); flashMsg("note saved"); }
+        const range = activeRange();
+        const where = range ? (range.start === range.end ? `L${range.start}` : `L${range.start}-${range.end}`) : chunk.context;
+        const text = editorPrompt(`${SCAFFOLD} note on ${chunk.file}\n${SCAFFOLD} ${where}\n\n`);
+        if (text) { persist((s) => addNote(s, chunk.id, text, range)); flashMsg(range ? "note saved (line-anchored)" : "note saved"); setSelAnchor(null); }
       }
-    } else if (lc === "t") setMode("tag");
+    } else if (lc === "t") { setPendingRange(activeRange()); setMode("tag"); }
     else if (lc === "z") undo();
     else if (input === "/") { setMode("search"); setBuffer(""); }
     else if (lc === "l") {
       if (chunk) {
+        setPendingRange(activeRange());
         const sugg = suggestLinks(chunk, chunks, state, importEdges);
         if (sugg.length) { setSuggestions(sugg); setMode("suggest"); }
         // Only free-pick needs a remembered source: navigation is live there, so
@@ -444,6 +607,15 @@ export default function App({ initialState, chunks, detail, importEdges }) {
       setIdx(0); setScroll(0);
     }
     else if (lc === "o") { setOrderMode((m) => (m === "risk" ? "file" : "risk")); setIdx(0); setScroll(0); flashMsg(orderMode === "risk" ? "order: file (grouped, read in place)" : "order: risk (highest-consequence first)"); }
+    // i — toggle the importers panel: WHO imports the current chunk's shared file
+    // (the blast radius behind the fan-out count). Only meaningful for shared files.
+    else if (lc === "i") {
+      if (importersOpen) setImportersOpen(false);
+      else if (!chunk) { /* nothing selected */ }
+      else if (!chunk.shared) flashMsg("not a shared file — no blast radius to show");
+      else if (chunk.unknown) flashMsg("fan-out unassessable (branch not checked out?)");
+      else setImportersOpen(true);
+    }
   });
 
   const seenCount = Object.keys(state.seen).length;
@@ -461,77 +633,180 @@ export default function App({ initialState, chunks, detail, importEdges }) {
         h(Box,
           { flexDirection: "column", borderStyle: "round", borderColor: "cyan", paddingX: 2, paddingY: 1 },
           h(Text, { bold: true, color: "cyan" }, "mrp — keys"),
-          h(Text, null, "  Tab        switch focus: sidebar (move chunks) ↔ hunk (scroll diff)"),
-          h(Text, null, "  j/k ↓/↑    sidebar: prev/next chunk · hunk: scroll line"),
-          h(Text, null, "  PgUp/PgDn  scroll hunk a page (also Ctrl+u / Ctrl+d)"),
+          h(Text, null, "  Tab        switch focus: sidebar (move chunks) ↔ hunk (line cursor)"),
+          h(Text, null, "  j/k ↓/↑    sidebar: prev/next chunk · hunk: move line cursor"),
+          h(Text, null, "  PgUp/PgDn  move cursor a page (also Ctrl+u / Ctrl+d)"),
           h(Text, null, "  [ / ]      jump prev / next file"),
           h(Text, null, "  { / }      jump prev / next annotated chunk"),
           h(Text, null, "  g / G      top / bottom (of list, or of hunk when focused)"),
+          h(Text, null, "  v          hunk: start/clear a line selection (note/tag/link then anchors to it)"),
           h(Text, null, "  space      ack (done); a chunk is auto-'seen' once its full body is scrolled into view"),
-          h(Text, null, "  n / t      note ($EDITOR) / tag"),
+          h(Text, null, "  n / t      note ($EDITOR) / tag — line-anchored when a selection is active"),
           h(Text, null, "  P          promote the chunk's note to a GitLab comment (confirm y)"),
           h(Text, null, "  l          link → pick a suggestion (1-9) or f to free-pick"),
           h(Text, null, "  z          undo last note/tag/link/ack"),
           h(Text, null, "  / u s d e  filter / unseen / shared / delta(new) / tests(all→hide→only)"),
           h(Text, null, "  o          toggle order: risk (consequence-first) ↔ file (grouped, read in place)"),
+          h(Text, null, "  i          importers: list the files that import this shared file (blast radius)"),
           h(Text, null, "  ? q        help / quit"),
           h(Text, { dimColor: true }, "state saves automatically · press ? or Esc to return")))
     : null;
 
   // ---- sidebar ----
-  const sidebarRows = [];
-  const maxSidebar = rows - 4;
-  const chunkMarks = (c) =>
-    (state.seen[c.id] ? "✓" : state.engaged?.[c.id] ? "·" : " ") +
-    ((state.notes[c.id] || []).length ? "▸" : " ") +
-    (linksFor(state, c.id).length ? "⇄" : " ") +
-    ((state.tags[c.id] || []).length ? "#" : " ");
+  // Build the FULL row list first (every chunk, every file header), then window
+  // it around the current selection so a large MR stays navigable: the map must
+  // never hide the cursor or silently drop the tail. Each row records the chunk
+  // id it belongs to (headers record their first chunk) so the scroll window can
+  // center on the selection regardless of order mode.
+  const allRows = []; // { key, el, chunkId }
+  // Status marks, each in its OWN color so the reviewer can tell at a glance which
+  // signal a row carries (seen vs note vs link vs tag) instead of scanning a gray
+  // blob. Returns an array of colored <Text> cells, one per mark slot (a space
+  // keeps columns aligned when a mark is absent). `dim` follows the row's seen
+  // state so acknowledged rows recede.
+  //
+  // IMPORTANT: pass plain=true for the CURRENT (inverse-highlighted) row. Nesting
+  // per-cell `color` inside an `inverse` <Text> makes Ink 5 emit escape sequences
+  // whose resets don't fully clear the inverse/color state, which then bleeds onto
+  // every row rendered after it (the "everything below the cursor goes foo" bug).
+  // A uniform, colorless inverse row composes cleanly.
+  const chunkMarkEls = (c, dim, plain) => {
+    const seen = state.seen[c.id];
+    const eng = state.engaged?.[c.id];
+    const hasNote = (state.notes[c.id] || []).length > 0;
+    const hasLink = linksFor(state, c.id).length > 0;
+    const hasTag = (state.tags[c.id] || []).length > 0;
+    const marks = (seen ? "✓" : eng ? "·" : " ") + (hasNote ? "▸" : " ") + (hasLink ? "⇄" : " ") + (hasTag ? "#" : " ");
+    if (plain) return [h(Text, { key: "marks" }, marks)]; // single uncolored cell
+    return [
+      h(Text, { key: "m-s", color: seen ? "green" : undefined, dimColor: dim && !seen }, seen ? "✓" : eng ? "·" : " "),
+      h(Text, { key: "m-n", color: hasNote ? "yellow" : undefined, dimColor: dim }, hasNote ? "▸" : " "),
+      h(Text, { key: "m-l", color: hasLink ? "magenta" : undefined, dimColor: dim }, hasLink ? "⇄" : " "),
+      h(Text, { key: "m-t", color: hasTag ? "cyan" : undefined, dimColor: dim }, hasTag ? "#" : " "),
+    ];
+  };
+  // Row label color: risk dominates (sensitive → red, unknown → yellow, shared →
+  // magenta) so risky files pop even without reading the glyph; then new (green) /
+  // test (blue); else the theme default. Kept in sync with riskColor's priority.
+  const labelColor = (c) =>
+    c.sensLabels?.length ? "red"
+    : c.unknown ? "yellow"
+    : c.shared ? "magenta"
+    : c.isNew ? "green"
+    : c.isTest ? "blue"
+    : undefined;
 
   if (orderMode === "risk") {
     // Flat, risk-ranked list — display order === navigation order (no teleport).
     // Each row carries its own file so there's no grouping header to imply order.
     visible.forEach((c, i) => {
-      if (sidebarRows.length >= maxSidebar) return;
       const isCur = chunk && c.id === chunk.id;
+      const seen = !isCur && state.seen[c.id];
       const shortFile = c.file.replace(/^app\/src\//, "").replace(/^.*\/(?=[^/]+$)/, "");
-      const risk = c.sensLabels?.length ? "⚠" : c.unknown ? "?" : c.shared ? "◆" : " ";
-      const label = `${shortFile} ${chunkLabel(c)}`.slice(0, SIDEBAR_W - 8);
-      sidebarRows.push(
+      const risk = riskGlyph(c);
+      const label = `${shortFile} ${chunkLabel(c)}`.slice(0, Math.max(4, sidebarInner - 8));
+      allRows.push({ key: c.id, chunkId: c.id, el:
         h(Text, { key: c.id, wrap: "truncate" },
           h(Text, { color: "cyan", bold: true }, isCur ? "▶" : " "),
-          h(Text, { color: c.sensLabels?.length ? "red" : c.shared ? "magenta" : "gray", dimColor: !c.sensLabels?.length }, risk),
-          h(Text, { inverse: isCur },
-            ` ${chunkMarks(c)} `,
-            h(Text, { color: c.isNew ? "green" : c.isTest ? "blue" : undefined, dimColor: !isCur && state.seen[c.id] }, label))));
+          h(Text, { color: riskColor(c), dimColor: !c.sensLabels?.length }, risk),
+          h(Text, { inverse: isCur }, " ", ...chunkMarkEls(c, seen, isCur), " ",
+            h(Text, { color: isCur ? undefined : labelColor(c), dimColor: seen }, label))) });
     });
   } else {
     for (const g of fileGroups) {
-      if (sidebarRows.length >= maxSidebar) break;
       const short = g.file.replace(/^app\/src\//, "").replace(/^.*\/(?=[^/]+\/[^/]+$)/, "…/");
-      const anyShared = g.chunks.some((c) => c.shared);
-      const anySensitive = g.chunks.some((c) => c.sensLabels?.length);
-      sidebarRows.push(
+      // File header shows the group's worst risk — fold the chunks into a synthetic
+      // risk-like object so the header uses the same glyph/color as the rows.
+      const agg = {
+        sensLabels: g.chunks.some((c) => c.sensLabels?.length) ? ["_"] : [],
+        unknown: g.chunks.some((c) => c.unknown),
+        shared: g.chunks.some((c) => c.shared),
+      };
+      const headGlyph = riskGlyph(agg);
+      // Header rows are NOT selectable — they carry `headerFor` (the group's first
+      // chunk) only so the scroll window can keep a header on screen with its
+      // children. They must never match the current-chunk lookup (which keys on
+      // `chunkId`), or the window would center one row above the real selection.
+      allRows.push({ key: `f-${g.file}`, headerFor: g.chunks[0]?.id, el:
         h(Text, { key: `f-${g.file}`, bold: true, wrap: "truncate" },
-          anySensitive ? h(Text, { color: "red" }, "⚠ ") : anyShared ? h(Text, { color: "magenta" }, "◆ ") : "  ",
-          short.slice(0, SIDEBAR_W - 3)));
+          headGlyph === " " ? "  " : h(Text, { color: riskColor(agg) }, `${headGlyph} `),
+          short.slice(0, Math.max(4, sidebarInner - 2))) });
       g.chunks.forEach((c, ci) => {
-        if (sidebarRows.length >= maxSidebar) return;
         const isCur = chunk && c.id === chunk.id;
+        const seen = !isCur && state.seen[c.id];
         const isLast = ci === g.chunks.length - 1;
         const connector = isLast ? "└─" : "├─";
-        const label = chunkLabel(c).slice(0, SIDEBAR_W - 11);
-        sidebarRows.push(
+        // Per-chunk risk glyph — the file header shows the group's worst risk, but
+        // once a file is expanded the reviewer needs to know WHICH chunk carries it.
+        // Mirrors the risk-mode row glyph so risk stays legible in either order.
+        const risk = riskGlyph(c);
+        const label = chunkLabel(c).slice(0, Math.max(4, sidebarInner - 10));
+        allRows.push({ key: c.id, chunkId: c.id, el:
           h(Text, { key: c.id, wrap: "truncate" },
             h(Text, { color: "cyan", bold: true }, isCur ? "▶" : " "),
             h(Text, { dimColor: true }, `${connector}`),
-            h(Text, { inverse: isCur },
-              ` ${chunkMarks(c)} `,
-              h(Text, { color: c.isNew ? "green" : c.isTest ? "blue" : undefined, dimColor: !isCur && state.seen[c.id] }, label))));
+            h(Text, { color: riskColor(c), dimColor: !c.sensLabels?.length }, risk),
+            h(Text, { inverse: isCur }, " ", ...chunkMarkEls(c, seen), " ",
+              h(Text, { color: labelColor(c), dimColor: seen }, label))) });
       });
     }
   }
+
+  // Window the rows so the current chunk is always visible. On a list taller than
+  // the pane we show "↑ N more"/"↓ N more" affordances.
+  //
+  // CONFIRMED ROOT CAUSE (via MRP_DEBUG model trace + raw ANSI capture via
+  // `script(1)`, see docs/BUG-sidebar-file-order-corruption.md): every frame in
+  // a whole session had exactly 74 embedded newlines — 19 frames straight, zero
+  // variance — until the exact frame where the window first needed to show the
+  // "↑ N more" row (a brand-new keyed element that had never existed in the
+  // tree before that point). That one frame emitted 76 newlines instead of 74,
+  // and Ink's terminal writer (log-update.js) blindly erases based on the
+  // PREVIOUS frame's line count and never re-verifies the terminal — so that
+  // one-time shape change permanently desyncs the erase/cursor bookkeeping for
+  // every frame after it. This is why it's always the same spot for a given MR
+  // + terminal size (deterministic: whichever row first needs a "more" row),
+  // why it moves after a resize (that row is a function of sidebarH/cols), and
+  // why it never self-heals (log-update has no correction mechanism).
+  //
+  // Fix: make the "↑ more"/"↓ more" slots ALWAYS-MOUNTED, fixed-position rows
+  // (blank when not needed) instead of conditionally inserting/removing them.
+  // They exist in the tree from the very first render, so this exact
+  // first-appearance event can never happen again. Always reserve their 2
+  // rows from the content budget up front (rather than relying on
+  // computeSidebarWindow's own capacity optimization, which is left
+  // untouched — it's pure/unit-tested) so the total rendered row count is
+  // 100% stable across every render, not just "numerically equal but
+  // differently composed."
+  const headerRows = 1; // the "MAP … order:" title line
+  const sidebarH = Math.max(3, appH - 2 - headerRows); // usable rows inside the bordered box
+  const total = allRows.length;
+  const curRowIdx = chunk ? sidebarRowIndex(allRows, chunk.id) : 0;
+  const contentH = Math.max(1, sidebarH - 2); // 2 rows permanently reserved for the affordances
+  const { start, end, above, below } = computeSidebarWindow(total, curRowIdx, contentH);
+
+  const sidebarRows = [
+    h(Text, { key: "s-up", dimColor: true }, above ? `  ↑ ${above} more` : ""),
+    ...allRows.slice(start, end).map((r) => r.el),
+    h(Text, { key: "s-dn", dimColor: true }, below ? `  ↓ ${below} more` : ""),
+  ];
+
+  if (process.env.MRP_DEBUG) {
+    try {
+      appendFileSync(process.env.MRP_DEBUG, JSON.stringify({
+        t: Date.now(), cols, rows, appH, sidebarW, sidebarH, bodyH,
+        orderMode, idx, safeIdx, chunkId: chunk?.id,
+        total, curRowIdx, start, end, above, below,
+        renderedRows: sidebarRows.length,
+        winRows: allRows.slice(start, end).map(r =>
+          r.chunkId ? "C:" + r.chunkId.split("/").pop()
+                    : "H:" + (r.headerFor||"").split("/").pop()),
+      }) + "\n");
+    } catch (e) { appendFileSync(process.env.MRP_DEBUG, "ERR " + e.message + "\n"); }
+  }
+
   const sidebar = h(Box,
-    { flexDirection: "column", width: SIDEBAR_W, marginRight: 1, borderStyle: "round", borderColor: focus === "sidebar" ? "cyan" : undefined, borderDimColor: focus !== "sidebar", paddingX: 1 },
+    { flexDirection: "column", width: sidebarW, height: "100%", overflow: "hidden", marginRight: 1, borderStyle: "round", borderColor: focus === "sidebar" ? "cyan" : undefined, borderDimColor: focus !== "sidebar", paddingX: 1 },
     h(Text, { bold: focus === "sidebar" }, focus === "sidebar" ? h(Text, { color: "cyan" }, "▶ MAP ") : h(Text, { dimColor: true }, "  MAP "), h(Text, { dimColor: true }, `${visible.length}ch · order:`), h(Text, { color: "yellow" }, orderMode)),
     ...sidebarRows);
 
@@ -557,7 +832,6 @@ export default function App({ initialState, chunks, detail, importEdges }) {
           h(Text, { dimColor: true }, chunkLabel(s.chunk)))),
     ];
   } else {
-    const numbered = withLineNumbers(chunk);
     const clampScroll = Math.min(scroll, maxScroll);
     const shown = numbered.slice(clampScroll, clampScroll + bodyH);
     const above = clampScroll;
@@ -573,9 +847,15 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     const base = shortFile.slice(dir.length);
 
     // Badge row for the file card — the risk signals, read left-to-right by priority.
+    const opBadge = chunk.op
+      ? { renamed: "[renamed]", deleted: "[deleted]", added: "[added]" }[chunk.op]
+      : null;
     const badges = [
       chunk.sensLabels?.length ? h(Text, { key: "b-sens", color: "red", bold: true }, `⚠ ${chunk.sensLabels.join("/")} `) : null,
       chunk.isNew ? h(Text, { key: "b-new", color: "green", bold: true }, "[new] ") : null,
+      // File operation (rename/delete/add). A metadata-only move has nothing to
+      // review, so it's dimmed; a delete or a rename-with-edits is not.
+      opBadge ? h(Text, { key: "b-op", color: chunk.op === "deleted" ? "red" : "cyan", dimColor: chunk.metaOnly }, `${opBadge}${chunk.metaOnly ? " (no content change)" : ""} `) : null,
       chunk.unknown ? h(Text, { key: "b-unk", color: "yellow" }, "[unassessed] ") : null,
       chunk.shared ? h(Text, { key: "b-sh", color: "magenta" }, chunk.fanOut ? `[shared ·${chunk.fanOut} imp] ` : "[shared] ") : null,
       chunk.isTest ? h(Text, { key: "b-test", color: "blue" }, "[test] ") : null,
@@ -597,23 +877,52 @@ export default function App({ initialState, chunks, detail, importEdges }) {
         h(Text, { dimColor: true }, " └▶ "),
         h(Text, { color: "cyan", bold: true }, hunkTitle.slice(0, paneW - 5))),
       // ---- diff body ----
-      h(Box, { key: "body", flexDirection: "column", borderStyle: "round", borderDimColor: focus !== "hunk", borderColor: focus === "hunk" ? "cyan" : undefined, paddingX: 1 },
+      h(Box, { key: "body", flexGrow: 1, flexDirection: "column", borderStyle: "round", borderDimColor: focus !== "hunk", borderColor: focus === "hunk" ? "cyan" : undefined, paddingX: 1 },
         above > 0 ? h(Text, { key: "up", dimColor: true }, `  ↑ ${above} more above`) : null,
         ...shown.map((r, i) => {
+          const abs = clampScroll + i;
           const c0 = r.line[0];
           const numColor = c0 === "+" ? "green" : c0 === "-" ? "red" : undefined;
-          return h(Text, { key: i, wrap: "truncate" },
+          // Cursor line (only when the hunk pane is focused) and visual-selection
+          // span are inverse-highlighted so the reviewer sees exactly what a
+          // note/tag/link will anchor to.
+          const isCursor = focus === "hunk" && abs === lineCur;
+          const selLo = selAnchor == null ? -1 : Math.min(selAnchor, lineCur);
+          const selHi = selAnchor == null ? -2 : Math.max(selAnchor, lineCur);
+          const inSel = abs >= selLo && abs <= selHi;
+          return h(Text, { key: i, wrap: "truncate", inverse: isCursor || inSel },
             h(Text, { color: numColor, dimColor: !numColor }, (r.num ? String(r.num) : "").padStart(gw) + " "),
             h(Text, { color: diffLineColor(r.line) }, r.line || " "));
         }),
         below > 0 ? h(Text, { key: "dn", color: "yellow" }, `  ↓ ${below} more below${focus !== "hunk" ? " (Tab → hunk to scroll)" : ""}`) : null),
-      tags.length ? h(Text, { key: "tags" }, ...tags.map((t) => h(Text, { key: t, color: "cyan" }, `#${t} `))) : null,
-      ...notes.map((nt, i) => h(Text, { key: `n${i}`, color: "yellow", wrap: "truncate" }, `  ${nt.promoted ? "▲" : "▸"} ${nt.text.replace(/\n/g, " ⏎ ")}${nt.promoted ? " (posted)" : ""}`)),
+      tags.length ? h(Text, { key: "tags" }, ...tags.map((t, ti) => h(Text, { key: `${tagName(t)}-${ti}`, color: "cyan" }, `#${tagName(t)}${fmtRange(tagRange(t))} `))) : null,
+      ...notes.map((nt, i) => h(Text, { key: `n${i}`, color: "yellow", wrap: "truncate" }, `  ${nt.promoted ? "▲" : "▸"}${fmtRange(nt.range)} ${nt.text.replace(/\n/g, " ⏎ ")}${nt.promoted ? " (posted)" : ""}`)),
       ...links.map((l, i) => {
         const other = l.from === chunk.id ? l.to : l.from;
         const arrow = l.from === chunk.id ? "→" : "←";
-        return h(Text, { key: `l${i}`, color: "magenta", wrap: "truncate" }, `  ⇄ ${arrow} ${other}${l.label ? ` (${l.label})` : ""}`);
+        return h(Text, { key: `l${i}`, color: "magenta", wrap: "truncate" }, `  ⇄ ${arrow}${fmtRange(l.range)} ${other}${l.label ? ` (${l.label})` : ""}`);
       }),
+      // ---- importers panel (docked at the bottom of the hunk pane) ----
+      // Toggled with `i`. Lists the files that import this shared module — the
+      // concrete blast radius behind the fan-out count. Capped to a few rows so it
+      // never eats the whole pane; a "+N more" tail shows the rest exists.
+      importersOpen ? (() => {
+        const all = chunk.importers || [];
+        const cap = Math.max(3, Math.floor(bodyH / 2)); // at most half the pane
+        const shown = all.slice(0, cap);
+        const rest = all.length - shown.length;
+        return h(Box, { key: "importers", flexDirection: "column", borderStyle: "round", borderColor: "magenta", borderDimColor: true, paddingX: 1 },
+          h(Text, { bold: true, color: "magenta", wrap: "truncate" },
+            `◆ importers · ${all.length} file(s) import this module`,
+            h(Text, { dimColor: true }, "  (i/Esc to close)")),
+          ...(all.length
+            ? shown.map((f, i) =>
+                h(Text, { key: f, wrap: "truncate" },
+                  h(Text, { dimColor: true }, `${String(i + 1).padStart(3)} `),
+                  h(Text, null, f.replace(/^app\/src\//, "").slice(0, paneW - 6))))
+            : [h(Text, { key: "none", dimColor: true }, "  (no importers found — reach of 0)")]),
+          rest > 0 ? h(Text, { key: "more", dimColor: true }, `  … +${rest} more`) : null);
+      })() : null,
     ];
   }
 
@@ -621,8 +930,8 @@ export default function App({ initialState, chunks, detail, importEdges }) {
   // mode and — in view mode — the focused pane.
   const viewKeys =
     focus === "hunk"
-      ? "j/k scroll · PgUp/PgDn page · g/G top/bottom · Tab →sidebar · space seen · n note · t tag · l link · z undo · ? help · q quit"
-      : "j/k move · [ ] file · } { annot · space ack · n note · P post · t tag · l link · z undo · / find · u/s/d/e filter · o order · ? help · q quit";
+      ? `j/k line · v ${selAnchor != null ? "clear-sel" : "select"} · PgUp/PgDn page · g/G top/bottom · Tab →sidebar · space seen · n note · t tag · l link · z undo · ? help · q quit`
+      : "j/k move · [ ] file · } { annot · space ack · n note · P post · t tag · l link · z undo · / find · u/s/d/e filter · o order · i importers · ? help · q quit";
   const activeFilters = [
     unseenOnly && "unseen",
     sharedOnly && "shared",
@@ -639,7 +948,9 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     : flash ? h(Text, { color: "green" }, flash)
     : h(Text, { dimColor: true }, `${viewKeys}${activeFilters.length ? `  [${activeFilters.join(" ")}]` : ""}`);
 
-  return h(Box, { flexDirection: "column" },
+  // Render ONE line short of the terminal height (see appH above). Leaving one
+  // spare line keeps every repaint in place instead of scroll-desyncing Ink.
+  return h(Box, { flexDirection: "column", height: appH, width: cols },
     h(Box, { key: "hd", justifyContent: "space-between" },
       h(Text, { key: "l" },
         h(Text, { color: "magenta", bold: true }, "▚▞ mrp"),
@@ -647,10 +958,16 @@ export default function App({ initialState, chunks, detail, importEdges }) {
         h(Text, { bold: true }, `!${detail.iid}`), " ",
         h(Text, { dimColor: true }, detail.title.slice(0, Math.max(16, cols - 52)))),
       h(Text, { key: "r", dimColor: true }, `${safeIdx + 1}/${visible.length} · ackd ${seenCount} · seen ${engagedCount}/${chunks.length}${riskyUnengaged ? ` · ⚠ ${riskyUnengaged} risky unseen` : ""} · ${noteCount} notes`)),
+    // The middle row grows to fill everything between the header and footer, so
+    // the panes always occupy the full terminal height regardless of diff length.
+    // overflow:hidden on the row AND each pane is CRITICAL: a tall hunk body or a
+    // long sidebar must be clipped to its box, or Ink's flex layout lets the
+    // overflow shove sibling rows around — which looked like the sidebar "jumping
+    // around" on large MRs (e.g. a 473-line new file in the right pane).
     help
-      ? h(Box, { key: "cols" }, helpModal)
-      : h(Box, { key: "cols" },
+      ? h(Box, { key: "cols", flexGrow: 1, overflow: "hidden" }, helpModal)
+      : h(Box, { key: "cols", flexGrow: 1, overflow: "hidden" },
           sidebar,
-          h(Box, { flexDirection: "column", width: paneW }, ...rightChildren)),
-    h(Box, { key: "ft", marginTop: 1 }, footer));
+          h(Box, { flexDirection: "column", width: paneW, height: "100%", overflow: "hidden" }, ...rightChildren)),
+    h(Box, { key: "ft" }, footer));
 }

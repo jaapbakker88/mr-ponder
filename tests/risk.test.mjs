@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { scoreChunks, riskOrder, orderChunks, SHARED_RE, TEST_RE } from "../src/risk.mjs";
+import { scoreChunks, riskOrder, orderChunks, sidebarRowIndex, computeSidebarWindow, SHARED_RE, TEST_RE } from "../src/risk.mjs";
 
 const EMPTY_REPO = mkdtempSync(join(tmpdir(), "mrp-risk-"));
 
@@ -41,6 +41,27 @@ test("scoreChunks sinks tests below everything (negative bias)", async () => {
   const [c] = await scoreChunks(chunks, EMPTY_REPO);
   assert.equal(c.isTest, true);
   assert.ok(c.risk < -900);
+});
+
+test("scoreChunks sinks metadata-only renames (nothing to review)", async () => {
+  const chunks = [{ file: "app/src/features/x/Moved.tsx", op: "renamed", added: 0, removed: 0 }];
+  const [c] = await scoreChunks(chunks, EMPTY_REPO);
+  assert.equal(c.metaOnly, true);
+  assert.ok(c.risk < -800, `expected deprioritized, got ${c.risk}`);
+});
+
+test("scoreChunks does NOT sink a rename that also edits content", async () => {
+  const chunks = [{ file: "app/src/features/x/Moved.tsx", op: "renamed", added: 12, removed: 3 }];
+  const [c] = await scoreChunks(chunks, EMPTY_REPO);
+  assert.equal(c.metaOnly, false);
+  assert.ok(c.risk > 0, `rename-with-edits should score normally, got ${c.risk}`);
+});
+
+test("scoreChunks: a pure delete is metadata-only", async () => {
+  const chunks = [{ file: "app/src/features/x/Gone.tsx", op: "deleted", added: 0, removed: 0 }];
+  const [c] = await scoreChunks(chunks, EMPTY_REPO);
+  assert.equal(c.metaOnly, true);
+  assert.ok(c.risk < -800);
 });
 
 test("scoreChunks marks shared files (fan-out unmeasurable in empty repo → unknown)", async () => {
@@ -154,4 +175,85 @@ test("orderChunks file mode keeps all chunks (no loss)", () => {
   const out = orderChunks(chunks, "file");
   assert.equal(out.length, 3);
   assert.deepEqual([...out.map((c) => c.id)].sort(), ["a", "b", "c"]);
+});
+
+// ---- sidebar windowing (file-order highlight-alignment regression) ----
+// Bug: in file order, header rows shared the same id as their first chunk, so the
+// "where is the cursor" lookup matched the HEADER row, mis-centering the scroll
+// window by one and (near boundaries) pushing the highlighted chunk off-screen —
+// "it starts jumping around". Header rows now carry `headerFor` (not `chunkId`),
+// so the lookup must ignore them.
+
+// Build a file-order row list exactly like the sidebar: a headerFor row per file,
+// then a chunkId row per chunk. Header.headerFor == the group's first chunk id.
+function fileOrderRows(files) {
+  const rows = [];
+  for (const g of files) {
+    rows.push({ headerFor: g.chunks[0] }); // header row — NOT selectable
+    for (const id of g.chunks) rows.push({ chunkId: id });
+  }
+  return rows;
+}
+
+test("sidebarRowIndex lands on the chunk row, never the file header", () => {
+  const rows = fileOrderRows([
+    { file: "a.ts", chunks: ["a1", "a2"] },
+    { file: "b.ts", chunks: ["b1"] },
+  ]);
+  // a1 is a file's FIRST chunk — the header above it has headerFor==="a1".
+  const i = sidebarRowIndex(rows, "a1");
+  assert.equal(rows[i].chunkId, "a1", "must resolve to the chunk row");
+  assert.equal(rows[i].headerFor, undefined, "must NOT be the header row");
+  // The header for a.ts sits at index 0; the a1 chunk row at index 1.
+  assert.equal(i, 1);
+});
+
+test("sidebarRowIndex returns 0 when id is absent", () => {
+  const rows = fileOrderRows([{ file: "a.ts", chunks: ["a1"] }]);
+  assert.equal(sidebarRowIndex(rows, "nope"), 0);
+});
+
+test("computeSidebarWindow always contains the current row (all positions)", () => {
+  // A realistic file-order list: several files, some multi-chunk.
+  const files = [
+    { file: "a.ts", chunks: ["a1", "a2", "a3"] },
+    { file: "b.ts", chunks: ["b1"] },
+    { file: "c.ts", chunks: ["c1", "c2"] },
+    { file: "d.ts", chunks: ["d1"] },
+    { file: "e.ts", chunks: ["e1", "e2", "e3"] },
+    { file: "f.ts", chunks: ["f1"] },
+  ];
+  const rows = fileOrderRows(files);
+  const total = rows.length;
+  const allIds = rows.filter((r) => r.chunkId).map((r) => r.chunkId);
+  for (const sidebarH of [4, 6, 9, 100]) {
+    for (const id of allIds) {
+      const cur = sidebarRowIndex(rows, id);
+      const { start, end } = computeSidebarWindow(total, cur, sidebarH);
+      assert.ok(
+        cur >= start && cur < end,
+        `cur row ${cur} (id ${id}) outside window [${start},${end}) at sidebarH=${sidebarH}`,
+      );
+      // And the row it points at is the chunk itself, not a header.
+      assert.equal(rows[cur].chunkId, id);
+    }
+  }
+});
+
+test("computeSidebarWindow returns the whole list when it fits", () => {
+  const w = computeSidebarWindow(10, 3, 20);
+  assert.deepEqual(w, { start: 0, end: 10, above: 0, below: 0 });
+});
+
+test("computeSidebarWindow shows only ↓ at the very top, only ↑ at the bottom", () => {
+  const total = 50, sidebarH = 10;
+  const top = computeSidebarWindow(total, 0, sidebarH);
+  assert.equal(top.above, 0, "no ↑ at the top");
+  assert.ok(top.below > 0, "↓ shows at the top");
+  assert.ok(0 >= top.start && 0 < top.end, "row 0 visible");
+
+  const bot = computeSidebarWindow(total, total - 1, sidebarH);
+  assert.ok(bot.above > 0, "↑ shows at the bottom");
+  assert.equal(bot.below, 0, "no ↓ at the bottom");
+  assert.ok(total - 1 >= bot.start && total - 1 < bot.end, "last row visible");
 });

@@ -13,6 +13,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { importSpec } from "./paths.mjs";
+import { tagName } from "./store.mjs";
 
 // Read the @/ specifiers a given repo file imports (best-effort). Prefer the
 // local checkout (complete import list), but the MR branch may not be checked
@@ -96,7 +97,7 @@ export function suggestLinks(chunk, chunks, state, importEdges, limit = 6) {
       .filter((l) => l.from === chunk.id || l.to === chunk.id)
       .map((l) => (l.from === chunk.id ? l.to : l.from)),
   );
-  const myTags = new Set(state.tags?.[chunk.id] || []);
+  const myTags = new Set((state.tags?.[chunk.id] || []).map(tagName));
   const edgeSet = importEdges.get(chunk.id) || new Set();
 
   const scored = new Map(); // id -> { chunk, score, reasons[] }
@@ -111,7 +112,7 @@ export function suggestLinks(chunk, chunks, state, importEdges, limit = 6) {
   for (const c of chunks) {
     if (c.file === chunk.file) bump(c, 2, "same file");
     if (edgeSet.has(c.id)) bump(c, 5, "import edge");
-    const shared = (state.tags?.[c.id] || []).filter((t) => myTags.has(t));
+    const shared = (state.tags?.[c.id] || []).map(tagName).filter((t) => myTags.has(t));
     if (shared.length) bump(c, 3 + shared.length, `#${shared[0]}`);
   }
 

@@ -147,9 +147,30 @@ async function main() {
     newCount: newIds.length,
   };
 
-  render(
+  // Take over the whole terminal via the alternate screen buffer (like vim/less):
+  // mrp renders full-height, and on exit the prior terminal contents are restored
+  // with no leftover frame in scrollback. Guarded to a TTY so piped/--export runs
+  // (which return before here) and non-TTY hosts are unaffected.
+  // MRP_NO_ALT=1 disables it (debug: some terminals mis-repaint tall Ink frames on
+  // the alt screen).
+  const altScreen = process.stdout.isTTY && !process.env.MRP_NO_ALT;
+  const enterAlt = () => process.stdout.write("\x1b[?1049h\x1b[H\x1b[?25l"); // alt buffer, home, hide cursor
+  const leaveAlt = () => process.stdout.write("\x1b[?25h\x1b[?1049l");       // show cursor, primary buffer
+  if (altScreen) {
+    enterAlt();
+    // Safety nets: restore the terminal however we exit (clean quit, Ctrl-C,
+    // uncaught throw). Idempotent — leaveAlt writing twice is harmless.
+    process.once("exit", () => { if (altScreen) leaveAlt(); });
+  }
+
+  const app = render(
     React.createElement(App, { initialState: state, chunks, detail: uiDetail, importEdges }),
     );
+  try {
+    await app.waitUntilExit();
+  } finally {
+    if (altScreen) leaveAlt();
+  }
   } finally {
     spin.stop(); // safety: clear the spinner even if a phase threw
   }

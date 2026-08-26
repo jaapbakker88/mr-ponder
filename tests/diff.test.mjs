@@ -82,9 +82,48 @@ test("synthetic chunk for diff with no @@ header (e.g. binary/new)", () => {
   assert.equal(h.removed, 0);
 });
 
-test("empty diff yields no hunks", () => {
+test("empty diff with no op yields no hunks", () => {
   assert.equal(parseFileHunks(fileWith("")).length, 0);
   assert.equal(parseFileHunks(fileWith("   \n  ")).length, 0);
+});
+
+test("pure rename (empty diff) still surfaces as one synthetic chunk", () => {
+  const f = { new_path: "app/src/b.ts", old_path: "app/src/a.ts", diff: "", renamed_file: true };
+  const [h] = parseFileHunks(f);
+  assert.ok(h, "rename must not vanish from the walk");
+  assert.equal(h.op, "renamed");
+  assert.equal(h.renamedFile, true);
+  assert.equal(h.file, "app/src/b.ts");
+  assert.equal(h.context, "renamed from app/src/a.ts");
+  assert.equal(h.added, 0);
+  assert.equal(h.removed, 0);
+});
+
+test("pure delete (empty diff) surfaces with op=deleted", () => {
+  const f = { old_path: "app/src/gone.ts", diff: "", deleted_file: true };
+  const [h] = parseFileHunks(f);
+  assert.ok(h);
+  assert.equal(h.op, "deleted");
+  assert.equal(h.deletedFile, true);
+  assert.equal(h.file, "app/src/gone.ts");
+});
+
+test("op is set on real hunks too (rename + content edit)", () => {
+  const f = {
+    new_path: "app/src/b.ts",
+    old_path: "app/src/a.ts",
+    renamed_file: true,
+    diff: "@@ -1,1 +1,1 @@\n-a\n+b",
+  };
+  const [h] = parseFileHunks(f);
+  assert.equal(h.op, "renamed");
+  assert.equal(h.added, 1);
+  assert.equal(h.removed, 1);
+});
+
+test("op is null for an ordinary modified file", () => {
+  const [h] = parseFileHunks(fileWith("@@ -1,1 +1,1 @@\n-a\n+b"));
+  assert.equal(h.op, null);
 });
 
 test("uses old_path when new_path absent (deleted file)", () => {

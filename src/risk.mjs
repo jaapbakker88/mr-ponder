@@ -14,11 +14,25 @@ const execFileP = promisify(execFile);
 // Re-exported for callers that historically imported these from risk.mjs.
 export { SHARED_RE, TEST_RE };
 
+// Single source of truth for how a chunk's risk renders. The sidebar shows this
+// in three places (risk-mode row, file-mode chunk row, and — aggregated — the
+// file header); keeping the glyph/color here stops those from drifting apart.
+// Priority: sensitive (consequence) > unknown (unassessable) > shared (reach).
+// Pass a chunk, or a synthetic {sensLabels, unknown, shared} for the file header.
+export function riskGlyph(c) {
+  return c.sensLabels?.length ? "⚠" : c.unknown ? "?" : c.shared ? "◆" : " ";
+}
+export function riskColor(c) {
+  return c.sensLabels?.length ? "red" : c.unknown ? "yellow" : c.shared ? "magenta" : "gray";
+}
+
 // How many modules import `spec` — the file's blast radius. Uses ripgrep
-// directly (no shell). Returns { count, failed }: rg exit 1 means "no matches"
-// (a genuine fan-out of 0), exit 2 (or rg missing / path absent) means we could
-// NOT assess it — surfaced as failed:true so the caller can fail loud instead of
-// treating an un-measurable file as low-risk.
+// directly (no shell). Returns { count, files, failed }: rg exit 1 means "no
+// matches" (a genuine fan-out of 0), exit 2 (or rg missing / path absent) means
+// we could NOT assess it — surfaced as failed:true so the caller can fail loud
+// instead of treating an un-measurable file as low-risk. `files` is the list of
+// importing paths (repo-relative) so the UI can show WHERE the reach lands, not
+// just how much of it there is.
 async function fanOut(spec, repoDir) {
   const escaped = spec.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const pattern = `from ['"]${escaped}['"/]`;
@@ -28,12 +42,13 @@ async function fanOut(spec, repoDir) {
       ["-l", "-e", pattern, "-g", "*.ts", "-g", "*.tsx", "app/src"],
       { cwd: repoDir, maxBuffer: 16 * 1024 * 1024 },
     );
-    return { count: stdout.split("\n").filter(Boolean).length, failed: false };
+    const files = stdout.split("\n").filter(Boolean);
+    return { count: files.length, files, failed: false };
   } catch (e) {
     // rg exit 1 = no matches (real 0, assessed). Anything else (exit 2, ENOENT,
     // missing dir) = we couldn't assess this file's reach.
-    if (e && e.code === 1) return { count: 0, failed: false };
-    return { count: 0, failed: true };
+    if (e && e.code === 1) return { count: 0, files: [], failed: false };
+    return { count: 0, files: [], failed: true };
   }
 }
 
@@ -67,12 +82,14 @@ export async function scoreChunks(chunks, repoDir) {
     // nudge it UP — "couldn't assess" is a reason to look, not to skip. A real
     // measured 0 is NOT unknown.
     let unknown = false;
+    let importers = [];
     if (shared && !isTest) {
       const spec = importSpec(c.file);
       if (spec) {
         const r = fanCache.get(spec);
         fan = r ? r.count : 0;
         unknown = r ? r.failed : true; // no spec resolved OR grep failed
+        importers = r ? r.files : [];
       } else {
         unknown = true;
       }
@@ -81,18 +98,30 @@ export async function scoreChunks(chunks, repoDir) {
     c.shared = shared;
     c.isTest = isTest;
     c.fanOut = fan;
+    // The actual importing files (repo-relative paths) — the WHERE behind the
+    // fan-out count, so the reviewer can open a panel and see the blast radius.
+    c.importers = importers;
     c.sensitivity = sens;
     c.sensLabels = sensLabels;
     c.unknown = unknown;
+    // A metadata-only change (pure rename, or a rename/mode change with no added
+    // or removed lines) has NO code to read — there is nothing in the hunk to
+    // review. Sink it like a test so it doesn't crowd out real logic, but keep it
+    // in the walk (the reviewer may still want to eyeball the move). Deletes and
+    // renames that ALSO change content are scored normally: those carry risk.
+    const metaOnly = (c.op === "renamed" || c.op === "deleted") && c.added + c.removed === 0;
+    c.metaOnly = metaOnly;
     // Risk score. Consequence (sensitivity) is categorical and DOMINATES; reach
     // (fan-out) has diminishing returns — importer #117 tells you little more than
     // #40 did — so it's log-dampened and capped, ensuring no amount of mundane
     // reach outranks a high-consequence path. A shared file still beats a leaf;
-    // unknown shared files get a fail-loud nudge; tests sink; size breaks ties.
+    // unknown shared files get a fail-loud nudge; tests and metadata-only moves
+    // sink; size breaks ties.
     //   fanScore: 0→0, 1→~35, 10→~120, 100→~230, 1000→~350 (cap 300 below)
     const fanScore = Math.min(fan > 0 ? Math.log10(fan + 1) * 115 : 0, 300);
     c.risk =
       (isTest ? -1000 : 0) +
+      (metaOnly ? -900 : 0) +
       sens +
       fanScore +
       (shared ? 50 : 0) +
@@ -130,4 +159,38 @@ export function orderChunks(chunks, mode) {
     ordered.push(...arr);
   }
   return ordered;
+}
+
+// Locate the current chunk's row in the sidebar row list. `rows` is the flat list
+// the sidebar renders: chunk rows carry `chunkId`; file-header rows do NOT (they
+// carry `headerFor` only, as a scroll anchor). This lookup MUST match on `chunkId`
+// exclusively — a header sharing the current chunk's id would otherwise be found
+// first and mis-center the scroll window by one row (the file-order highlight bug).
+// Returns the row index, or 0 when not found (empty list / no selection).
+export function sidebarRowIndex(rows, curId) {
+  const i = rows.findIndex((r) => r.chunkId != null && r.chunkId === curId);
+  return i < 0 ? 0 : i;
+}
+
+// Compute the visible window over `total` sidebar rows so that `curRowIdx` stays
+// on screen, reserving a row for each "↑/↓ N more" affordance that is actually
+// shown. Pure math (no rendering) so it can be unit-tested. Returns
+// { start, end, above, below } where [start,end) is the slice of rows to render.
+export function computeSidebarWindow(total, curRowIdx, sidebarH) {
+  if (total <= sidebarH) return { start: 0, end: total, above: 0, below: 0 };
+  const windowFor = (cap) =>
+    Math.min(Math.max(0, curRowIdx - Math.floor(cap / 2)), total - cap);
+  // Assume both indicators first (worst case), then relax if pinned to an end.
+  let capacity = sidebarH - 2;
+  let start = windowFor(capacity);
+  let above = start > 0;
+  let below = start + capacity < total;
+  if (!above || !below) {
+    capacity = sidebarH - 1;
+    start = windowFor(capacity);
+    above = start > 0;
+    below = start + capacity < total;
+  }
+  const end = Math.min(total, start + capacity);
+  return { start, end, above: above ? start : 0, below: below ? total - end : 0 };
 }

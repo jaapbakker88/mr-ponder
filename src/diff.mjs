@@ -12,6 +12,14 @@ export function parseFileHunks(file) {
   const raw = file.diff || "";
   const lines = raw.split("\n");
 
+  // File-level operation flags, normalized once so every synthetic/real hunk
+  // carries the same signal. `op` is the single categorical label the UI, risk
+  // scorer, and export read; the booleans stay for back-compat.
+  const newFile = !!file.new_file;
+  const deletedFile = !!file.deleted_file;
+  const renamedFile = !!file.renamed_file;
+  const op = deletedFile ? "deleted" : newFile ? "added" : renamedFile ? "renamed" : null;
+
   const hunks = [];
   let current = null;
 
@@ -36,9 +44,10 @@ export function parseFileHunks(file) {
         body: [line], // include the @@ header as the first body line
         added: 0,
         removed: 0,
-        newFile: !!file.new_file,
-        deletedFile: !!file.deleted_file,
-        renamedFile: !!file.renamed_file,
+        newFile,
+        deletedFile,
+        renamedFile,
+        op,
       };
     } else if (current) {
       current.body.push(line);
@@ -50,24 +59,37 @@ export function parseFileHunks(file) {
   }
   if (current) hunks.push(current);
 
-  // A pure add/delete with no @@ (e.g. binary) yields no hunks — represent the
-  // whole file as one synthetic chunk so it still shows up in the walk.
-  if (!hunks.length && raw.trim()) {
+  // No @@ hunks emitted. Two sub-cases, both represented as one synthetic chunk
+  // so the file still shows up in the walk instead of silently vanishing:
+  //   1. raw content but no @@ header (binary, or a whole-file add/delete blob)
+  //   2. a metadata-only op (pure rename, or a rename/mode change with an empty
+  //      diff) — previously dropped entirely, so the reviewer never saw it.
+  if (!hunks.length && (raw.trim() || op)) {
+    const oldPath = file.old_path && file.old_path !== path ? file.old_path : null;
+    const summary =
+      op === "renamed" && oldPath ? `renamed from ${oldPath}`
+      : op === "renamed" ? "renamed"
+      : op === "deleted" ? "file deleted"
+      : op === "added" ? "file added"
+      : "";
     hunks.push({
       id: `${path}@0:0`,
       file: path,
       header: `@@ ${path} @@`,
-      context: "",
+      context: summary,
       oldStart: 0,
       oldCount: 0,
       newStart: 0,
       newCount: 0,
-      body: lines,
+      // For a metadata-only op there's no diff text — seed the body with a
+      // one-line human summary so the hunk pane isn't blank.
+      body: raw.trim() ? lines : [`@@ ${path} @@`, summary || "(no content change)"],
       added: (raw.match(/^\+/gm) || []).length,
       removed: (raw.match(/^-/gm) || []).length,
-      newFile: !!file.new_file,
-      deletedFile: !!file.deleted_file,
-      renamedFile: !!file.renamed_file,
+      newFile,
+      deletedFile,
+      renamedFile,
+      op,
     });
   }
   return hunks;
