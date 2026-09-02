@@ -1,5 +1,8 @@
 // gitlab.mjs — thin async wrapper over the authenticated `glab` CLI.
 import { execFile } from "node:child_process";
+import { writeFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileP = promisify(execFile);
@@ -67,6 +70,7 @@ export function buildPosition(chunk, diffRefs) {
     new_path: chunk.file,
     old_path: chunk.file,
     new_line: chunk.newStart,
+    old_line: null, // must be explicit null in JSON; absent/form-encoded → GitLab posts as general note
   };
 }
 
@@ -75,11 +79,22 @@ export function buildPosition(chunk, diffRefs) {
 // un-promoted and shows the error).
 export async function postDiffNote(project, iid, position, body) {
   const P = enc(project);
-  const args = ["api", "--method", "POST", `projects/${P}/merge_requests/${iid}/discussions`, "-f", `body=${body}`];
-  for (const [k, v] of Object.entries(position)) {
-    if (v === undefined || v === null) continue;
-    args.push("-f", `position[${k}]=${v}`);
+  // Must use JSON body (--input), not -f form fields. Form encoding cannot express
+  // old_line: null — GitLab silently accepts it but the note lands as a general
+  // MR comment instead of an inline diff note. JSON null serialises correctly.
+  // Use a temp file: execFile's `input` option is not supported by the async
+  // variant (only by execFileSync/spawnSync), so --input - would hang.
+  const tmp = join(tmpdir(), `mrp-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  try {
+    writeFileSync(tmp, JSON.stringify({ body, position }));
+    const { stdout } = await execFileP(
+      "glab",
+      ["api", "--method", "POST", `projects/${P}/merge_requests/${iid}/discussions`,
+       "-H", "Content-Type: application/json", "--input", tmp],
+      { maxBuffer: 16 * 1024 * 1024 },
+    );
+    return JSON.parse(stdout);
+  } finally {
+    try { unlinkSync(tmp); } catch { /* best-effort cleanup */ }
   }
-  const { stdout } = await execFileP("glab", args, { maxBuffer: 16 * 1024 * 1024 });
-  return JSON.parse(stdout);
 }

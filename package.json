@@ -3,9 +3,16 @@
   "version": "0.1.0",
   "description": "git add -p, but for reviewing an existing GitLab MR: step through hunks risk-first and attach private notes/tags/links.",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "bin": {
     "mrp": "./mrp.mjs"
   },
+  "files": [
+    "mrp.mjs",
+    "src/"
+  ],
   "scripts": {
     "start": "node mrp.mjs",
     "test": "node --test"

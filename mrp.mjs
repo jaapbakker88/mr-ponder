@@ -16,8 +16,6 @@
 
 import React from "react";
 import { render } from "ink";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { fetchMrDetail, fetchMrChanges, preflight } from "./src/gitlab.mjs";
 import { parseChanges } from "./src/diff.mjs";
 import { scoreChunks, riskOrder } from "./src/risk.mjs";
@@ -45,10 +43,18 @@ const exportFormat = opt("--format", "json");
 const exportAll = flag("--all");
 const exportOut = opt("--out", null);
 
-const project =
-  opt("--project", process.env.MR_PROJECT) ||
-  "<group>/<project>";
-const repoDir = process.env.MR_REPO_DIR || join(homedir(), "work", "<project>");
+const project = opt("--project", process.env.MR_PROJECT);
+if (!project) {
+  console.error(
+    "error: no project specified.\n" +
+    "  Set MR_PROJECT=owner/repo  (or pass --project owner/repo)",
+  );
+  process.exit(1);
+}
+
+// Optional: local checkout used to compute import fan-out (blast radius).
+// When absent, blast-radius scoring falls back to imports visible in the diff.
+const repoDir = process.env.MR_REPO_DIR ?? null;
 
 // A minimal stderr spinner that shows the current startup phase. Animates only
 // on a TTY; on a pipe it prints one static line per phase. stop() clears the
@@ -145,6 +151,8 @@ async function main() {
     headSha,
     diffRefs: detail.diff_refs || null,
     newCount: newIds.length,
+    staleSha,
+    orphanedCount: orphaned.length,
   };
 
   // Take over the whole terminal via the alternate screen buffer (like vim/less):

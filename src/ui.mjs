@@ -103,6 +103,98 @@ function withLineNumbers(chunk) {
 
 // short label for a chunk row in the sidebar: line + context, or a +/- summary
 // when git emitted no context snippet (so a row is never just a bare number).
+// Lines eligible for pattern matching: added + context only, never the @@
+// header (body[0]) or removed lines.
+function patternEligibleLines(chunk) {
+  return chunk.body.slice(1).filter((l) => !l.startsWith("-"));
+}
+
+// Compile a user pattern to a tester. Tries regex first (case-insensitive);
+// falls back to literal substring if the source isn't valid regex.
+// Returns { test: (line) => bool, reG: RegExp (global), isLiteral: bool }.
+function compilePattern(raw) {
+  try {
+    const re = new RegExp(raw, "i");
+    return { test: (s) => re.test(s), reG: new RegExp(raw, "gi"), isLiteral: false };
+  } catch {
+    const needle = raw.toLowerCase();
+    const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return {
+      test: (s) => s.toLowerCase().includes(needle),
+      reG: new RegExp(escaped, "gi"),
+      isLiteral: true,
+    };
+  }
+}
+
+// Extract identifiers from a chunk that also appear in at least one other chunk.
+// Two signals:
+//   B — chunk.context (@@ header): the enclosing function/class/type name.
+//       Any declaration pattern, min 6 chars.
+//   A — exported declarations in added (+) code lines only, skipping comments.
+//       Requiring `export` means the symbol is reachable from other files.
+// Only identifiers that appear in ≥1 other chunk survive (nothing to follow otherwise).
+const DECL_RE = /(?:export\s+(?:default\s+)?)?(?:const|let|var|function\*?|async\s+function\*?|class|type|interface|enum)\s+([A-Za-z_$][A-Za-z0-9_$]+)/g;
+const EXPORT_DECL_RE = /export\s+(?:default\s+)?(?:const|let|var|function\*?|async\s+function\*?|class|type|interface|enum)\s+([A-Za-z_$][A-Za-z0-9_$]+)/g;
+// Generic names that pass other filters but aren't useful search threads.
+const ID_STOP = new Set(["default", "render", "children", "handler", "callback", "undefined", "toString", "prototype", "constructor"]);
+function extractIdCandidates(chunk, allChunks, limit = 9) {
+  const myIds = new Set();
+  const add = (id) => { if (id.length >= 6 && !ID_STOP.has(id)) myIds.add(id); };
+
+  // B: chunk.context — one high-confidence candidate per chunk.
+  if (chunk.context) {
+    DECL_RE.lastIndex = 0;
+    const m = DECL_RE.exec(chunk.context);
+    if (m) add(m[1]);
+  }
+
+  // A: exported declarations in added lines only; skip comment lines.
+  const addedCode = chunk.body.slice(1)
+    .filter((l) => l.startsWith("+"))
+    .map((l) => l.slice(1))
+    .filter((l) => { const t = l.trimStart(); return !t.startsWith("//") && !t.startsWith("*") && !t.startsWith("/*") && !t.startsWith("#"); });
+  for (const line of addedCode) {
+    EXPORT_DECL_RE.lastIndex = 0;
+    for (const m of line.matchAll(EXPORT_DECL_RE)) add(m[1]);
+  }
+
+  if (!myIds.size) return [];
+
+  // Cross-reference: count other chunks that mention each id.
+  const counts = new Map();
+  for (const other of allChunks) {
+    if (other.id === chunk.id) continue;
+    const otherLines = patternEligibleLines(other);
+    for (const id of myIds) {
+      const re = new RegExp(`\\b${id}\\b`);
+      if (otherLines.some((l) => re.test(l))) counts.set(id, (counts.get(id) || 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .filter(([, c]) => c > 0)
+    .sort((a, z) => z[1] - a[1] || a[0].localeCompare(z[0]))
+    .slice(0, limit)
+    .map(([id, count]) => ({ id, count }));
+}
+
+// Split a line string into plain/matched segments for in-hunk highlighting.
+// Returns [{ text, matched }, ...]. Always at least one segment.
+// Only call when a pattern is active; compiled must have a .reG global regex.
+function highlightSegments(line, compiled) {
+  const segments = [];
+  let lastIdx = 0;
+  for (const m of line.matchAll(compiled.reG)) {
+    if (m[0].length === 0) continue; // skip zero-width matches
+    if (m.index > lastIdx) segments.push({ text: line.slice(lastIdx, m.index), matched: false });
+    segments.push({ text: m[0], matched: true });
+    lastIdx = m.index + m[0].length;
+  }
+  if (lastIdx < line.length) segments.push({ text: line.slice(lastIdx), matched: false });
+  if (!segments.length) segments.push({ text: line, matched: false });
+  return segments;
+}
+
 function chunkLabel(c) {
   const loc = c.newStart ? `L${c.newStart}` : "·";
   // Metadata-only moves (pure rename/delete/add) have no useful line/context —
@@ -129,7 +221,7 @@ export default function App({ initialState, chunks, detail, importEdges }) {
   const { stdout } = useStdout();
   const [state, setState] = useState(initialState);
   const [idx, setIdx] = useState(0);
-  const [mode, setMode] = useState("view"); // view | tag | search | suggest
+  const [mode, setMode] = useState("view"); // view | tag | search | suggest | ident | freepick
   const [buffer, setBuffer] = useState("");
   const [filter, setFilter] = useState("");
   const [unseenOnly, setUnseenOnly] = useState(false);
@@ -137,7 +229,9 @@ export default function App({ initialState, chunks, detail, importEdges }) {
   const [deltaOnly, setDeltaOnly] = useState(false); // show only chunks new since last review
   const [testFilter, setTestFilter] = useState("all"); // all | hide (no tests) | only (tests only)
   const [orderMode, setOrderMode] = useState("risk"); // risk (flat priority) | file (grouped)
+  const [pattern, setPattern] = useState(""); // regex/substring over hunk bodies (`\` filter)
   const [suggestions, setSuggestions] = useState([]);
+  const [identCandidates, setIdentCandidates] = useState([]); // * identifier picker
   const [linkArmed, setLinkArmed] = useState(null);
   const [help, setHelp] = useState(false);
   const [importersOpen, setImportersOpen] = useState(false); // importer-locations overlay
@@ -149,6 +243,9 @@ export default function App({ initialState, chunks, detail, importEdges }) {
   const [pendingRange, setPendingRange] = useState(null); // range captured when a tag/link flow began
   const [confirmPromote, setConfirmPromote] = useState(false); // awaiting y/Esc to post
   const undoStack = React.useRef([]); // deep snapshots of state before each mutation
+  const orderAnchor = React.useRef(null); // chunk id to re-find after an order toggle
+  const [warnDismissed, setWarnDismissed] = useState(false); // stale-SHA badge dismissed
+  const [warnOverlay, setWarnOverlay] = useState(false);     // stale-SHA overlay open
 
   const persist = (mutator) =>
     setState((prev) => {
@@ -175,6 +272,9 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     setTimeout(() => setFlash(""), 1500);
   };
 
+  // True while the stale-SHA badge should be visible (MR updated, not yet dismissed).
+  const warnActive = !!(detail.staleSha && !warnDismissed);
+
   // Promote the chunk's latest un-promoted note to a GitLab discussion (A1 coarse
   // anchoring). Async: posts, then marks the note promoted only on success.
   const promoteCurrentNote = () => {
@@ -184,6 +284,10 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     if (!chunk || idx < 0) { flashMsg("no un-promoted note here"); return; }
     const position = buildPosition(chunk, detail.diffRefs);
     if (!position) { flashMsg("can't anchor a comment to this hunk"); return; }
+    // Use the note's own line anchor when present — chunk.newStart is just the
+    // hunk's first line, not where the reviewer actually put the note.
+    const noteLine = notes[idx].range?.start;
+    if (noteLine) position.new_line = noteLine;
     flashMsg("posting…");
     postDiffNote(detail.project, detail.iid, position, notes[idx].text)
       .then((disc) => {
@@ -212,15 +316,20 @@ export default function App({ initialState, chunks, detail, importEdges }) {
           c.file.toLowerCase().includes(q) ||
           (c.context || "").toLowerCase().includes(q) ||
           notes.toLowerCase().includes(q) ||
-          tags.toLowerCase().includes(q)
+          tags.toLowerCase().includes(q) ||
+          patternEligibleLines(c).some((l) => l.toLowerCase().includes(q))
         );
       });
+    }
+    if (pattern) {
+      const p = compilePattern(pattern);
+      list = list.filter((c) => patternEligibleLines(c).some((l) => p.test(l)));
     }
     // CRITICAL: navigation walks `visible` in array order, and the sidebar renders
     // `visible` in the same order — they must agree or the cursor "teleports".
     // orderChunks encapsulates the risk-vs-file ordering (see risk.mjs).
     return orderChunks(list, orderMode);
-  }, [chunks, state, unseenOnly, sharedOnly, deltaOnly, testFilter, filter, orderMode]);
+  }, [chunks, state, unseenOnly, sharedOnly, deltaOnly, testFilter, filter, orderMode, pattern]);
 
   const safeIdx = Math.min(idx, Math.max(0, visible.length - 1));
   const chunk = visible[safeIdx];
@@ -232,6 +341,21 @@ export default function App({ initialState, chunks, detail, importEdges }) {
   useEffect(() => {
     if (idx !== safeIdx) setIdx(safeIdx);
   }, [idx, safeIdx]);
+
+  // After a sort-order toggle, restore the cursor to the chunk that was focused
+  // before the reorder — anchor on identity (chunk.id), not on index, since the
+  // index is exactly what changes. orderAnchor.current is stashed by the `o`
+  // handler just before flipping orderMode (async state update), so this effect
+  // always runs against the freshly-reordered visible array with a valid id or
+  // skips immediately. Reuses the findIndex-by-id pattern from jumpFile.
+  useEffect(() => {
+    if (orderAnchor.current == null) return;
+    const target = visible.findIndex((c) => c.id === orderAnchor.current);
+    orderAnchor.current = null; // consume — one-shot per toggle
+    if (target < 0) return; // anchored chunk filtered out — safeIdx clamp handles it
+    setIdx(target);
+    setScroll(0);
+  }, [orderMode, visible]);
 
   // Sidebar model: visible chunks grouped by file, preserving risk order.
   const fileGroups = useMemo(() => {
@@ -428,6 +552,14 @@ export default function App({ initialState, chunks, detail, importEdges }) {
       return;
     }
 
+    // Warning overlay is open: any key dismisses it (closing = acknowledging).
+    if (warnOverlay) {
+      setWarnOverlay(false);
+      setWarnDismissed(true);
+      if (lc === "d") { setDeltaOnly((v) => !v); setIdx(0); setScroll(0); }
+      return;
+    }
+
     // Esc closes the importers panel (when nothing else claims Esc). The panel is
     // NOT a modal — normal navigation keeps working while it's open; only `i` and
     // Esc toggle it, handled here / in the `i` key below.
@@ -443,7 +575,7 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     }
 
     // text-entry modes
-    if (mode === "tag" || mode === "search") {
+    if (mode === "tag" || mode === "search" || mode === "pattern") {
       if (key.return) {
         if (mode === "tag" && chunk) {
           persist((s) => addTag(s, chunk.id, buffer, pendingRange));
@@ -452,6 +584,10 @@ export default function App({ initialState, chunks, detail, importEdges }) {
           setSelAnchor(null);
         }
         if (mode === "search") { setFilter(buffer); setIdx(0); setScroll(0); }
+        if (mode === "pattern") {
+          if (buffer && compilePattern(buffer).isLiteral) flashMsg("matched literally (invalid regex — treating as plain text)");
+          setPattern(buffer); setIdx(0); setScroll(0);
+        }
         setBuffer("");
         setMode("view");
         return;
@@ -461,6 +597,7 @@ export default function App({ initialState, chunks, detail, importEdges }) {
         setMode("view");
         setPendingRange(null);
         if (mode === "search") { setFilter(""); setIdx(0); setScroll(0); }
+        if (mode === "pattern") { setPattern(""); setIdx(0); setScroll(0); }
         return;
       }
       if (key.backspace || key.delete) return setBuffer((b) => b.slice(0, -1));
@@ -496,6 +633,19 @@ export default function App({ initialState, chunks, detail, importEdges }) {
         setPendingRange(null);
         setSelAnchor(null);
         flashMsg(range ? "linked (line-anchored)" : "linked");
+      }
+      return;
+    }
+
+    // identifier-pick mode (* key): choose a shared identifier to set as pattern.
+    if (mode === "ident") {
+      if (key.escape) { setMode("view"); setIdentCandidates([]); return; }
+      const n = parseInt(input, 10);
+      if (n >= 1 && n <= identCandidates.length) {
+        const { id } = identCandidates[n - 1];
+        setPattern(id); setIdx(0); setScroll(0);
+        setMode("view"); setIdentCandidates([]);
+        flashMsg(`\\${id} — n/N to hop matches, Esc to clear`);
       }
       return;
     }
@@ -541,6 +691,7 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     // normal keys
     if (lc === "q") return exit();
     if (input === "?") return setHelp((v) => !v);
+    if (input === "!" && warnActive) return setWarnOverlay((v) => !v);
     // j/k (and arrows) drive whichever pane has focus: sidebar = move between
     // chunks; hunk = move the line cursor (scroll follows). Tab toggles focus.
     if (key.downArrow || lc === "j") {
@@ -579,7 +730,19 @@ export default function App({ initialState, chunks, detail, importEdges }) {
       else { setConfirmPromote(true); flashMsg("promote note to GitLab? y = post, any key = cancel"); }
     }
     else if (lc === "n") {
-      if (chunk) {
+      if (pattern) {
+        // n/N: jump to next/prev pattern match. Works regardless of which pane has
+        // focus so you can chase a thread without switching to the sidebar first.
+        // visible is already filtered to matching chunks when pattern is active.
+        const dir = input === "N" ? -1 : 1;
+        const len = visible.length;
+        if (len === 0) flashMsg(`no matches for \\${pattern}`);
+        else {
+          const next = ((safeIdx + dir) % len + len) % len;
+          if (next === safeIdx) flashMsg("only one match");
+          else { setIdx(next); setScroll(0); }
+        }
+      } else if (chunk) {
         const range = activeRange();
         const where = range ? (range.start === range.end ? `L${range.start}` : `L${range.start}-${range.end}`) : chunk.context;
         const text = editorPrompt(`${SCAFFOLD} note on ${chunk.file}\n${SCAFFOLD} ${where}\n\n`);
@@ -588,6 +751,7 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     } else if (lc === "t") { setPendingRange(activeRange()); setMode("tag"); }
     else if (lc === "z") undo();
     else if (input === "/") { setMode("search"); setBuffer(""); }
+    else if (input === "\\") { setMode("pattern"); setBuffer(""); }
     else if (lc === "l") {
       if (chunk) {
         setPendingRange(activeRange());
@@ -598,15 +762,28 @@ export default function App({ initialState, chunks, detail, importEdges }) {
         // straight from the current chunk.
         else { setLinkArmed(chunk.id); setMode("freepick"); flashMsg("no suggestions — navigate to target, Enter to link"); }
       }
-    }     else if (lc === "u") { setUnseenOnly((v) => !v); setIdx(0); setScroll(0); }
+    }
+    else if (input === "*") {
+      // * — pick a shared identifier from the current chunk to set as pattern.
+      if (chunk) {
+        const cands = extractIdCandidates(chunk, chunks);
+        if (!cands.length) flashMsg("no shared identifiers found in this chunk");
+        else { setIdentCandidates(cands); setMode("ident"); }
+      }
+    }
+    else if (lc === "u") { setUnseenOnly((v) => !v); setIdx(0); setScroll(0); }
     else if (lc === "s") { setSharedOnly((v) => !v); setIdx(0); setScroll(0); }
-    else if (lc === "d") { setDeltaOnly((v) => !v); setIdx(0); setScroll(0); }
+    else if (lc === "d") { setDeltaOnly((v) => !v); setIdx(0); setScroll(0); if (warnActive) { setWarnDismissed(true); setWarnOverlay(false); } }
     // T cycles the test filter: all → hide tests → only tests → all.
     else if (lc === "e") {
       setTestFilter((m) => (m === "all" ? "hide" : m === "hide" ? "only" : "all"));
       setIdx(0); setScroll(0);
     }
-    else if (lc === "o") { setOrderMode((m) => (m === "risk" ? "file" : "risk")); setIdx(0); setScroll(0); flashMsg(orderMode === "risk" ? "order: file (grouped, read in place)" : "order: risk (highest-consequence first)"); }
+    else if (lc === "o") {
+      orderAnchor.current = chunk?.id ?? null;
+      setOrderMode((m) => (m === "risk" ? "file" : "risk"));
+      flashMsg(orderMode === "risk" ? "order: file (grouped, read in place)" : "order: risk (highest-consequence first)");
+    }
     // i — toggle the importers panel: WHO imports the current chunk's shared file
     // (the blast radius behind the fan-out count). Only meaningful for shared files.
     else if (lc === "i") {
@@ -641,15 +818,31 @@ export default function App({ initialState, chunks, detail, importEdges }) {
           h(Text, null, "  g / G      top / bottom (of list, or of hunk when focused)"),
           h(Text, null, "  v          hunk: start/clear a line selection (note/tag/link then anchors to it)"),
           h(Text, null, "  space      ack (done); a chunk is auto-'seen' once its full body is scrolled into view"),
-          h(Text, null, "  n / t      note ($EDITOR) / tag — line-anchored when a selection is active"),
-          h(Text, null, "  P          promote the chunk's note to a GitLab comment (confirm y)"),
-          h(Text, null, "  l          link → pick a suggestion (1-9) or f to free-pick"),
-          h(Text, null, "  z          undo last note/tag/link/ack"),
-          h(Text, null, "  / u s d e  filter / unseen / shared / delta(new) / tests(all→hide→only)"),
+           h(Text, null, "  n / N / t  note ($EDITOR) / next·prev pattern match / tag — line-anchored when a selection is active"),
+           h(Text, null, "  P          promote the chunk's note to a GitLab comment (confirm y)"),
+           h(Text, null, "  l          link → pick a suggestion (1-9) or f to free-pick"),
+           h(Text, null, "  *          pick a shared identifier from this chunk → sets pattern (n/N to hop)"),
+           h(Text, null, "  z          undo last note/tag/link/ack"),
+          h(Text, null, "  / u s d e  / find (file · context · notes · tags · body) / unseen / shared / delta / tests"),
+          h(Text, null, "  \\          pattern search over hunk bodies with highlighting (regex; Esc=clear)"),
           h(Text, null, "  o          toggle order: risk (consequence-first) ↔ file (grouped, read in place)"),
           h(Text, null, "  i          importers: list the files that import this shared file (blast radius)"),
-          h(Text, null, "  ? q        help / quit"),
+          h(Text, null, "  ? ! q      help / MR-updated warning / quit"),
           h(Text, { dimColor: true }, "state saves automatically · press ? or Esc to return")))
+    : null;
+
+  // Warning overlay: shown when `!` is pressed while the stale-SHA badge is active.
+  const warnModal = warnOverlay
+    ? h(Box, { justifyContent: "center", width: cols },
+        h(Box,
+          { flexDirection: "column", borderStyle: "round", borderColor: "yellow", paddingX: 2, paddingY: 1 },
+          h(Text, { bold: true, color: "yellow" }, "⚠  MR updated since last review (head SHA changed)"),
+          h(Text, null, ""),
+          h(Text, null, `  ${detail.orphanedCount} annotated chunk(s) no longer match the current diff.`),
+          h(Text, null, `  ${detail.newCount} new/changed chunk(s) since last review.`),
+          h(Text, null, "  Your notes are preserved but may point at shifted lines."),
+          h(Text, null, ""),
+          h(Text, null, "  Press 'd' to review just the delta, or any key to dismiss.")))
     : null;
 
   // ---- sidebar ----
@@ -814,8 +1007,11 @@ export default function App({ initialState, chunks, detail, importEdges }) {
   let rightChildren;
   if (!chunk) {
     rightChildren = [
-      h(Text, { key: "e", color: "yellow" }, "No chunks match the current filter."),
-      h(Text, { key: "h", dimColor: true }, "u=unseen s=shared /=search (Esc clears) · q quit"),
+      h(Text, { key: "e", color: "yellow" },
+        pattern
+          ? `No chunks match \\${pattern} (pattern filter active).`
+          : "No chunks match the current filter."),
+      h(Text, { key: "h", dimColor: true }, "u=unseen s=shared /=search \\ pattern (Esc clears) · q quit"),
     ];
   } else if (mode === "suggest") {
     // link suggestion list
@@ -831,9 +1027,23 @@ export default function App({ initialState, chunks, detail, importEdges }) {
           h(Text, null, `${s.chunk.file.replace(/^app\/src\//, "")} `),
           h(Text, { dimColor: true }, chunkLabel(s.chunk)))),
     ];
+  } else if (mode === "ident") {
+    // identifier-pick panel — * key
+    rightChildren = [
+      h(Text, { key: "t", bold: true, color: "cyan" }, `Identifiers: ${chunkLabel(chunk)}`),
+      h(Text, { key: "f", dimColor: true }, chunk.file),
+      h(Text, { key: "sp" }, " "),
+      h(Text, { key: "hd", bold: true }, "Shared identifiers — press number to search, Esc=cancel"),
+      ...identCandidates.map((c, i) =>
+        h(Text, { key: c.id },
+          h(Text, { color: "cyan" }, ` ${i + 1} `),
+          h(Text, { color: "yellow" }, c.id),
+          h(Text, { dimColor: true }, `  ×${c.count} other chunk${c.count === 1 ? "" : "s"}`))),
+    ];
   } else {
     const clampScroll = Math.min(scroll, maxScroll);
     const shown = numbered.slice(clampScroll, clampScroll + bodyH);
+    const compiledPat = pattern ? compilePattern(pattern) : null;
     const above = clampScroll;
     const below = numbered.length - (clampScroll + shown.length);
     // Gutter width from the largest new-file line number in this hunk.
@@ -890,9 +1100,19 @@ export default function App({ initialState, chunks, detail, importEdges }) {
           const selLo = selAnchor == null ? -1 : Math.min(selAnchor, lineCur);
           const selHi = selAnchor == null ? -2 : Math.max(selAnchor, lineCur);
           const inSel = abs >= selLo && abs <= selHi;
+          // When a pattern is active, highlight matched substrings in added/context
+          // lines with bold+underline. Bold+underline composes cleanly inside an
+          // inverse row; per-cell `color` changes inside `inverse` are what leaks
+          // escape state (see chunkMarkEls comment above), not bold/underline.
+          const lineColor = diffLineColor(r.line);
+          const patEligible = compiledPat && r.line[0] !== "-" && r.line[0] !== "@";
+          const lineEls = patEligible
+            ? highlightSegments(r.line || " ", compiledPat).map((seg, si) =>
+                h(Text, { key: si, color: lineColor, bold: seg.matched, underline: seg.matched }, seg.text))
+            : [h(Text, { key: "t", color: lineColor }, r.line || " ")];
           return h(Text, { key: i, wrap: "truncate", inverse: isCursor || inSel },
             h(Text, { color: numColor, dimColor: !numColor }, (r.num ? String(r.num) : "").padStart(gw) + " "),
-            h(Text, { color: diffLineColor(r.line) }, r.line || " "));
+            ...lineEls);
         }),
         below > 0 ? h(Text, { key: "dn", color: "yellow" }, `  ↓ ${below} more below${focus !== "hunk" ? " (Tab → hunk to scroll)" : ""}`) : null),
       tags.length ? h(Text, { key: "tags" }, ...tags.map((t, ti) => h(Text, { key: `${tagName(t)}-${ti}`, color: "cyan" }, `#${tagName(t)}${fmtRange(tagRange(t))} `))) : null,
@@ -930,20 +1150,23 @@ export default function App({ initialState, chunks, detail, importEdges }) {
   // mode and — in view mode — the focused pane.
   const viewKeys =
     focus === "hunk"
-      ? `j/k line · v ${selAnchor != null ? "clear-sel" : "select"} · PgUp/PgDn page · g/G top/bottom · Tab →sidebar · space seen · n note · t tag · l link · z undo · ? help · q quit`
-      : "j/k move · [ ] file · } { annot · space ack · n note · P post · t tag · l link · z undo · / find · u/s/d/e filter · o order · i importers · ? help · q quit";
+      ? `j/k line · v ${selAnchor != null ? "clear-sel" : "select"} · PgUp/PgDn page · g/G top/bottom · Tab →sidebar · space seen · n${pattern ? "/N match" : " note"} · t tag · l link · z undo · ? help · q quit`
+      : `j/k move · [ ] file · } { annot · space ack · ${pattern ? "n/N match · " : "n note · "}P post · t tag · l link · z undo · / find · \\ pattern · u/s/d/e filter · o order · i importers · ? help · q quit`;
   const activeFilters = [
     unseenOnly && "unseen",
     sharedOnly && "shared",
     deltaOnly && "delta",
     testFilter !== "all" && `tests:${testFilter}`,
     filter && `/${filter}`,
+    pattern && `\\${pattern}`,
   ].filter(Boolean);
   const footer =
     confirmPromote ? h(Text, { color: "yellow", bold: true }, "post this note to GitLab as a comment?  y = post · any other key = cancel")
     : mode === "tag" ? h(Text, { color: "cyan" }, `tag: ${buffer}▌  (Enter=save, Esc=cancel)`)
     : mode === "search" ? h(Text, { color: "cyan" }, `/${buffer}▌  (Enter=apply, Esc=clear)`)
+    : mode === "pattern" ? h(Text, { color: "yellow" }, `\\${buffer}▌  (regex over +/context lines · Enter=apply, Esc=clear)`)
     : mode === "suggest" ? h(Text, { color: "magenta" }, "pick: 1-9=link · f=free-pick · Esc=cancel")
+    : mode === "ident" ? h(Text, { color: "cyan" }, "pick: 1-9=search identifier · Esc=cancel")
     : mode === "freepick" ? h(Text, { color: "magenta" }, "free-pick: navigate to target, Enter=link, Esc=cancel")
     : flash ? h(Text, { color: "green" }, flash)
     : h(Text, { dimColor: true }, `${viewKeys}${activeFilters.length ? `  [${activeFilters.join(" ")}]` : ""}`);
@@ -957,14 +1180,18 @@ export default function App({ initialState, chunks, detail, importEdges }) {
         h(Text, { dimColor: true }, " · "),
         h(Text, { bold: true }, `!${detail.iid}`), " ",
         h(Text, { dimColor: true }, detail.title.slice(0, Math.max(16, cols - 52)))),
-      h(Text, { key: "r", dimColor: true }, `${safeIdx + 1}/${visible.length} · ackd ${seenCount} · seen ${engagedCount}/${chunks.length}${riskyUnengaged ? ` · ⚠ ${riskyUnengaged} risky unseen` : ""} · ${noteCount} notes`)),
+      h(Text, { key: "r" },
+        warnActive ? h(Text, { color: "yellow" }, `⚠ +${detail.newCount} ~${detail.orphanedCount}  `) : null,
+        h(Text, { dimColor: true }, `${safeIdx + 1}/${visible.length} · ackd ${seenCount} · seen ${engagedCount}/${chunks.length}${riskyUnengaged ? ` · ⚠ ${riskyUnengaged} risky unseen` : ""} · ${noteCount} notes`))),
     // The middle row grows to fill everything between the header and footer, so
     // the panes always occupy the full terminal height regardless of diff length.
     // overflow:hidden on the row AND each pane is CRITICAL: a tall hunk body or a
     // long sidebar must be clipped to its box, or Ink's flex layout lets the
     // overflow shove sibling rows around — which looked like the sidebar "jumping
     // around" on large MRs (e.g. a 473-line new file in the right pane).
-    help
+    warnOverlay
+      ? h(Box, { key: "cols", flexGrow: 1, overflow: "hidden" }, warnModal)
+      : help
       ? h(Box, { key: "cols", flexGrow: 1, overflow: "hidden" }, helpModal)
       : h(Box, { key: "cols", flexGrow: 1, overflow: "hidden" },
           sidebar,

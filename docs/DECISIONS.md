@@ -220,3 +220,50 @@ fire — assert the trigger, not just the effect.
 | P1 | Honest "engaged" vs "displayed" seen | `seen` is read as compliance; today it lies — **DONE** (dual ack/engaged signal + risky-unseen gate) |
 | P2 | Score MR-branch imports; sort unknowns up | Fail-loud on the risky direction — unknowns DONE; MR-branch scoring open |
 | P2 | Shared risk model with `mrs` | Triage and deep-read must agree on "risky" — **PARKED** (see "Known gaps", needs cross-repo decision) |
+
+## Follow-the-thread navigation: `n`/`N`, `*`, `/` body search
+
+**Decision (2026-08-31):** three features shipped together to address the core
+friction of reviewing AI-generated MRs with no narrative: you land on a chunk cold
+and need to understand why code is split the way it is.
+
+**`n`/`N` — hop between pattern matches**
+
+When `\` is active, `n` moves to the next matching chunk and `N` to the previous,
+wrapping. Critically, both work regardless of whether sidebar or hunk pane has
+focus — you can read a hunk and press `n` to jump to the next match without
+switching focus first. When no pattern is active, `n` falls through to the note
+editor (unchanged).
+
+**`*` — set `\` from an identifier in the current chunk**
+
+Press `*` on any chunk to see a ranked list of identifiers from that chunk that
+appear in at least one other chunk in the diff. Two signals, in priority order:
+
+1. The `@@` context line identifier (the enclosing function/class/type name) —
+   one per chunk, highest confidence.
+2. Exported declarations (`export const/function/class/type/interface`) in added
+   lines only, skipping comment lines — requires `export` so only symbols actually
+   reachable from other files are candidates.
+
+Candidates shorter than 6 chars or on a small stoplist (`default`, `render`,
+`children`, …) are filtered. Ranked by how many other chunks mention each one.
+Pick `1`–`9` → sets `\` to that identifier; `n`/`N` then hop through all
+occurrences. The two features compose: `*` → pick → `n`/`N` is the full
+"follow the thread" loop.
+
+**Why not auto-set on single candidate:** the first version silently set the
+pattern when only one candidate existed. In practice this was confusing — the
+reviewer couldn't see what was selected or why. Always showing the panel gives
+visibility and feels intentional.
+
+**`/` searches diff body as well as metadata**
+
+Previously `/` searched only file path, `@@` context, notes, and tags; `\`
+searched only the diff body. The split was designed as complementary but in
+practice was just confusing — typing `/useFeatureFlag` returned nothing because
+the reviewer didn't know to use `\`.
+
+`/` now searches all of the above plus the diff body (case-insensitive substring).
+`\` remains distinct: regex support, and in-hunk highlighting of matches. The
+distinction is now *find* vs *find + highlight*.
