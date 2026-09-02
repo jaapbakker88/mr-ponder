@@ -1,22 +1,25 @@
 #!/usr/bin/env node
-// mrp — "MR ponder". git add -p, but for reviewing an existing GitLab MR:
+// mrp — "MR ponder". git add -p, but for reviewing an existing MR/PR:
 // step through the diff hunk-by-hunk, risk-first, attaching PRIVATE notes,
 // tags, and chunk-to-chunk links. Notes live locally (never posted); the walk
 // is a thinking tool for connecting the dots across a big change.
 //
 // Usage:
-//   mrp <iid>                     review MR !<iid>
-//   mrp <iid> --project a/b/c     override project
-//   mrp <iid> --refetch           re-pull the diff (after a force-push)
+//   mrp <number>                        review MR/PR <number>
+//   mrp <number> --project owner/repo   override project (or set MR_PROJECT)
+//   mrp <number> --forge github|gitlab  override auto-detected forge (or set FORGE)
+//   mrp <number> --refetch              re-pull the diff (after a force-push)
 //
 // Env:
-//   MR_PROJECT    default project path
+//   MR_PROJECT    default project path (e.g. "owner/repo" for GitHub, "group/project" for GitLab)
 //   MR_REPO_DIR   local checkout used to compute import fan-out (blast radius)
+//   FORGE         forge backend: github or gitlab (auto-detected from git remote if unset)
 //   EDITOR        editor used for notes (default: vi)
 
 import React from "react";
 import { render } from "ink";
-import { fetchMrDetail, fetchMrChanges, preflight } from "./src/gitlab.mjs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { parseChanges } from "./src/diff.mjs";
 import { scoreChunks, riskOrder } from "./src/risk.mjs";
 import { buildImportEdges } from "./src/suggest.mjs";
@@ -24,6 +27,25 @@ import { loadState, saveState, reconcile } from "./src/store.mjs";
 import { buildExport, toMarkdown } from "./src/export.mjs";
 import { writeFileSync } from "node:fs";
 import App from "./src/ui.mjs";
+
+const execFileP = promisify(execFile);
+
+// Resolve which forge to use. Priority: --forge flag > FORGE env var >
+// auto-detect from git remote in repoDir > default (gitlab).
+async function detectForge(forgeFlag, repoDir) {
+  const explicit = (forgeFlag || process.env.FORGE || "").toLowerCase();
+  if (explicit === "github" || explicit === "gitlab") return explicit;
+  if (repoDir) {
+    try {
+      const { stdout } = await execFileP(
+        "git", ["remote", "get-url", "origin"],
+        { cwd: repoDir, timeout: 5_000 },
+      );
+      if (stdout.includes("github.com")) return "github";
+    } catch { /* not a git repo, no remote, or repoDir absent */ }
+  }
+  return "gitlab"; // backward-compat default
+}
 
 const args = process.argv.slice(2);
 const flag = (n) => args.includes(n);
@@ -86,6 +108,12 @@ function makeSpinner() {
 }
 
 async function main() {
+  const forge = await detectForge(opt("--forge", null), repoDir);
+  const forgeAdapter = await import(
+    forge === "github" ? "./src/github.mjs" : "./src/gitlab.mjs"
+  );
+  const { preflight, fetchMrDetail, fetchMrChanges } = forgeAdapter;
+
   await preflight();
   const spin = makeSpinner();
   try {
@@ -146,6 +174,7 @@ async function main() {
   const uiDetail = {
     iid: Number(iid),
     project,
+    forgeName: forge,
     title: (detail.title || "").replace(/\s+/g, " ").trim(),
     web_url: detail.web_url,
     headSha,
@@ -172,7 +201,7 @@ async function main() {
   }
 
   const app = render(
-    React.createElement(App, { initialState: state, chunks, detail: uiDetail, importEdges }),
+    React.createElement(App, { initialState: state, chunks, detail: uiDetail, importEdges, forge: forgeAdapter }),
     );
   try {
     await app.waitUntilExit();

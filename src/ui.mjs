@@ -29,7 +29,6 @@ import { join } from "node:path";
 import { saveState, addNote, toggleSeen, addTag, addLink, linksFor, markEngaged, markNotePromoted, tagName, tagRange } from "./store.mjs";
 import { suggestLinks } from "./suggest.mjs";
 import { orderChunks, riskGlyph, riskColor, sidebarRowIndex, computeSidebarWindow } from "./risk.mjs";
-import { buildPosition, postDiffNote } from "./gitlab.mjs";
 
 const h = React.createElement;
 // Sidebar width scales with the terminal so file names get more room on wide
@@ -216,7 +215,7 @@ function fmtRange(r) {
   return r.start === r.end ? ` L${r.start}` : ` L${r.start}-${r.end}`;
 }
 
-export default function App({ initialState, chunks, detail, importEdges }) {
+export default function App({ initialState, chunks, detail, importEdges, forge }) {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const [state, setState] = useState(initialState);
@@ -275,27 +274,28 @@ export default function App({ initialState, chunks, detail, importEdges }) {
   // True while the stale-SHA badge should be visible (MR updated, not yet dismissed).
   const warnActive = !!(detail.staleSha && !warnDismissed);
 
-  // Promote the chunk's latest un-promoted note to a GitLab discussion (A1 coarse
-  // anchoring). Async: posts, then marks the note promoted only on success.
+  // Promote the chunk's latest un-promoted note to a remote review comment (A1
+  // coarse anchoring). Async: posts, then marks the note promoted only on success.
   const promoteCurrentNote = () => {
     setConfirmPromote(false);
     const notes = (chunk && state.notes[chunk.id]) || [];
     const idx = notes.map((n) => !n.promoted).lastIndexOf(true); // newest un-promoted
     if (!chunk || idx < 0) { flashMsg("no un-promoted note here"); return; }
-    const position = buildPosition(chunk, detail.diffRefs);
+    const position = forge.buildPosition(chunk, detail.diffRefs);
     if (!position) { flashMsg("can't anchor a comment to this hunk"); return; }
     // Use the note's own line anchor when present — chunk.newStart is just the
     // hunk's first line, not where the reviewer actually put the note.
     const noteLine = notes[idx].range?.start;
     if (noteLine) position.new_line = noteLine;
     flashMsg("posting…");
-    postDiffNote(detail.project, detail.iid, position, notes[idx].text)
+    forge.postDiffNote(detail.project, detail.iid, position, notes[idx].text)
       .then((disc) => {
         persist((s) => markNotePromoted(s, chunk.id, idx, {
           discussionId: disc?.id || null,
           headSha: detail.headSha,
         }));
-        flashMsg("posted to GitLab");
+        const target = detail.forgeName === "github" ? "GitHub" : "GitLab";
+        flashMsg(`posted to ${target}`);
       })
       .catch((e) => flashMsg(`post failed: ${(e.message || "error").slice(0, 40)}`));
   };
@@ -722,12 +722,16 @@ export default function App({ initialState, chunks, detail, importEdges }) {
     }
     else if (key.escape && selAnchor != null) { setSelAnchor(null); flashMsg("selection cleared"); }
     else if (input === " ") { if (chunk) persist((s) => toggleSeen(s, chunk.id)); }
-    // P (capital, deliberate) — promote a note to a GitLab comment. Leaves the laptop.
+    // P (capital, deliberate) — promote a note to a review comment. Leaves the repo.
     else if (input === "P") {
       const notes = (chunk && state.notes[chunk.id]) || [];
       if (!notes.some((n) => !n.promoted)) { flashMsg("no un-promoted note here"); }
-      else if (!buildPosition(chunk, detail.diffRefs)) { flashMsg("can't anchor a comment to this hunk"); }
-      else { setConfirmPromote(true); flashMsg("promote note to GitLab? y = post, any key = cancel"); }
+      else if (!forge.buildPosition(chunk, detail.diffRefs)) { flashMsg("can't anchor a comment to this hunk"); }
+      else {
+        const target = detail.forgeName === "github" ? "GitHub PR" : "GitLab MR";
+        setConfirmPromote(true);
+        flashMsg(`promote note to ${target}? y = post, any key = cancel`);
+      }
     }
     else if (lc === "n") {
       if (pattern) {
@@ -819,7 +823,7 @@ export default function App({ initialState, chunks, detail, importEdges }) {
           h(Text, null, "  v          hunk: start/clear a line selection (note/tag/link then anchors to it)"),
           h(Text, null, "  space      ack (done); a chunk is auto-'seen' once its full body is scrolled into view"),
            h(Text, null, "  n / N / t  note ($EDITOR) / next·prev pattern match / tag — line-anchored when a selection is active"),
-           h(Text, null, "  P          promote the chunk's note to a GitLab comment (confirm y)"),
+           h(Text, null, "  P          promote the chunk's note to a review comment on the forge (confirm y)"),
            h(Text, null, "  l          link → pick a suggestion (1-9) or f to free-pick"),
            h(Text, null, "  *          pick a shared identifier from this chunk → sets pattern (n/N to hop)"),
            h(Text, null, "  z          undo last note/tag/link/ack"),
