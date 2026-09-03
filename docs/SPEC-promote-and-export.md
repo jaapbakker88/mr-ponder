@@ -1,6 +1,16 @@
 # Spec: promote-to-comment & structured export
 
-**Status:** DESIGN (no code yet) · **Priority:** P0 (adoption gate) · **Drafted:** 2026-08-26
+**Status:** DONE (see note) · **Priority:** P0 (adoption gate) · **Drafted:** 2026-08-26 · **Shipped:** 2026-09-02
+**Note:** all four sequencing steps shipped — B-json, A1, A2 (line-precise via
+`note.range`), B-md. Verified against the code 2026-09-02: `buildExport`/
+`toMarkdown` (`src/export.mjs`, tested in `tests/export.test.mjs`), `P` →
+`promoteCurrentNote` (`src/ui.mjs`) with confirm flow and
+`markNotePromoted`-only-on-success, `postDiffNote`/`buildPosition` for both
+`gitlab.mjs` and `github.mjs`. **One spec item intentionally dropped:** the
+in-TUI export key (`e`) — `e` was later assigned to the test-filter cycle, and
+CLI `--export` covers the exit. Also shipped beyond spec: stale-promoted
+awareness via `promoted.headSha`, `engaged` in the summary, `range` on notes/
+tags/links in both formats.
 
 Companion to the P0 items in `DECISIONS.md` → *"Local-first is the right on-ramp
 and the wrong endpoint."* Today a review's conclusions live in one JSON file on one

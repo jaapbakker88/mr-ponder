@@ -1,6 +1,7 @@
 # Ticket: housekeeping — CI, stale docs README, docs index
 
-Type: chore · Status: open · **Priority:** P2 (small, do anytime) · **Drafted:** 2026-09-02
+Type: chore · Status: closed (shipped 2026-09-02: CI green on node 20/22/24,
+`docs/README.md` deleted, roadmap linked from root README) · **Drafted:** 2026-09-02
 **From:** `docs/IDEAS.md` §7
 
 Three small items, bundled because none deserves its own spec.
