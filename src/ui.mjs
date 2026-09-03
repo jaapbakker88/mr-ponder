@@ -229,6 +229,7 @@ export default function App({ initialState, chunks, detail, importEdges, forge }
   const [testFilter, setTestFilter] = useState("all"); // all | hide (no tests) | only (tests only)
   const [orderMode, setOrderMode] = useState("risk"); // risk (flat priority) | file (grouped)
   const [pattern, setPattern] = useState(""); // regex/substring over hunk bodies (`\` filter)
+  const [flatMatchIdx, setFlatMatchIdx] = useState(0); // position within flatMatches
   const [suggestions, setSuggestions] = useState([]);
   const [identCandidates, setIdentCandidates] = useState([]); // * identifier picker
   const [linkArmed, setLinkArmed] = useState(null);
@@ -241,8 +242,9 @@ export default function App({ initialState, chunks, detail, importEdges, forge }
   const [selAnchor, setSelAnchor] = useState(null); // visual-select start index, or null
   const [pendingRange, setPendingRange] = useState(null); // range captured when a tag/link flow began
   const [confirmPromote, setConfirmPromote] = useState(false); // awaiting y/Esc to post
-  const undoStack = React.useRef([]); // deep snapshots of state before each mutation
+  const undoStack = React.useRef([]);    // deep snapshots of state before each mutation
   const orderAnchor = React.useRef(null); // chunk id to re-find after an order toggle
+  const flatNavRef = React.useRef(false); // true while n/N is driving flatMatchIdx
   const [warnDismissed, setWarnDismissed] = useState(false); // stale-SHA badge dismissed
   const [warnOverlay, setWarnOverlay] = useState(false);     // stale-SHA overlay open
 
@@ -331,6 +333,32 @@ export default function App({ initialState, chunks, detail, importEdges, forge }
     return orderChunks(list, orderMode);
   }, [chunks, state, unseenOnly, sharedOnly, deltaOnly, testFilter, filter, orderMode, pattern]);
 
+  // Flat list of every pattern-matching line across all visible chunks.
+  // Each entry: { chunkIdx, bodyIdx } where bodyIdx is the index into chunk.body
+  // (>= 1; body[0] is the @@ header).  Used by n/N to jump to individual match
+  // instances rather than just the next matching chunk.
+  const flatMatches = useMemo(() => {
+    if (!pattern) return [];
+    const p = compilePattern(pattern);
+    const matches = [];
+    visible.forEach((c, chunkIdx) => {
+      c.body.forEach((line, bodyIdx) => {
+        if (bodyIdx === 0 || line.startsWith("-")) return; // skip @@ header + removed
+        if (p.test(line)) matches.push({ chunkIdx, bodyIdx });
+      });
+    });
+    return matches;
+  }, [visible, pattern]);
+
+  // Stats exposed for the search status panel (see TICKET-grilling-search-status-panel).
+  // flatTotal / flatIdx: global position in the match list.
+  // matchesInChunk / chunkMatchIdx: position within the current chunk's matches.
+  const flatTotal = flatMatches.length;
+  const matchesInChunk = flatMatches.filter((m) => m.chunkIdx === safeIdx).length;
+  const chunkMatchIdx = (flatMatches[flatMatchIdx]?.chunkIdx === safeIdx)
+    ? flatMatches.filter((_, i) => flatMatches[i].chunkIdx === safeIdx && i < flatMatchIdx).length
+    : 0;
+
   const safeIdx = Math.min(idx, Math.max(0, visible.length - 1));
   const chunk = visible[safeIdx];
 
@@ -341,6 +369,16 @@ export default function App({ initialState, chunks, detail, importEdges, forge }
   useEffect(() => {
     if (idx !== safeIdx) setIdx(safeIdx);
   }, [idx, safeIdx]);
+
+  // When the pattern or the current chunk changes, reset the flat-match cursor to
+  // the first match in the (new) current chunk.  Skip when n/N itself caused the
+  // chunk change — flatNavRef guards against the effect undoing what n/N just did.
+  useEffect(() => {
+    if (flatNavRef.current) { flatNavRef.current = false; return; }
+    if (!pattern || flatMatches.length === 0) { setFlatMatchIdx(0); return; }
+    const first = flatMatches.findIndex((m) => m.chunkIdx === safeIdx);
+    setFlatMatchIdx(first >= 0 ? first : 0);
+  }, [safeIdx, pattern, flatMatches]);
 
   // After a sort-order toggle, restore the cursor to the chunk that was focused
   // before the reorder — anchor on identity (chunk.id), not on index, since the
@@ -735,16 +773,25 @@ export default function App({ initialState, chunks, detail, importEdges, forge }
     }
     else if (lc === "n") {
       if (pattern) {
-        // n/N: jump to next/prev pattern match. Works regardless of which pane has
-        // focus so you can chase a thread without switching to the sidebar first.
-        // visible is already filtered to matching chunks when pattern is active.
+        // n/N: step through the flat match list — one entry per matching line,
+        // not one per matching chunk.  Centers the matched line in the viewport.
         const dir = input === "N" ? -1 : 1;
-        const len = visible.length;
-        if (len === 0) flashMsg(`no matches for \\${pattern}`);
+        const len = flatMatches.length;
+        if (len === 0) { flashMsg(`no matches for \\${pattern}`); }
+        else if (len === 1) { flashMsg("only one match"); }
         else {
-          const next = ((safeIdx + dir) % len + len) % len;
-          if (next === safeIdx) flashMsg("only one match");
-          else { setIdx(next); setScroll(0); }
+          const next = ((flatMatchIdx + dir) % len + len) % len;
+          const m = flatMatches[next];
+          const targetChunk = visible[m.chunkIdx];
+          const chunkBodyLen = targetChunk ? targetChunk.body.length : 0;
+          const targetScroll = Math.max(
+            0,
+            Math.min(m.bodyIdx - Math.floor(bodyH / 2), Math.max(0, chunkBodyLen - bodyH)),
+          );
+          flatNavRef.current = true; // prevent reset useEffect from fighting this
+          setFlatMatchIdx(next);
+          setIdx(m.chunkIdx);
+          setScroll(targetScroll);
         }
       } else if (chunk) {
         const range = activeRange();
