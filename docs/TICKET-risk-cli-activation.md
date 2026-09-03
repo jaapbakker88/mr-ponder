@@ -3,6 +3,55 @@
 Type: **grilling + prototype**
 Blocked by: [Config Schema](TICKET-risk-config-schema.md)
 Blocks: [Migration Path](TICKET-risk-migration.md)
+**Status: RESOLVED**
+
+## Resolution
+
+No `--pipeline` flag. `MR_PRESET` env var supported. Unknown preset = hard error.
+`--list-presets` prints available presets with descriptions.
+
+### Activation precedence (highest wins)
+
+```
+1. --preset <name>          CLI flag
+2. MR_PRESET=<name>         Environment variable
+3. "pipeline": [...]        Active config file (inline pipeline)
+4. "preset": "<name>"       Active config file (named preset)
+5. built-in "default"       Implicit fallback
+```
+
+Active config = `.mrp.json` in repo root if present, else `~/.config/mrp/config.json`.
+
+### New CLI flags
+
+```
+--preset <name>     Activate a named preset (built-in or user-defined).
+--list-presets      Print available presets with one-line descriptions, then exit.
+```
+
+### `--list-presets` output shape
+
+```
+Available presets (active config: ~/.config/mrp/config.json)
+
+  default      General-purpose MR review. Reproduces the classic mrp scoring.
+  security     Auth/money/infra-heavy MRs. Sensitivity dominant; authorship weighted up.
+  refactor     Large mechanical rewrites. Fan-out dominant; churn expected and dampened.
+  db-migration Schema change MRs. Migration/SQL rules maximised; size amplified.
+
+  myPreset     (user-defined) [no description]
+```
+
+### Error on unknown preset
+
+```
+mrp: unknown preset "foo"
+Available presets: default, security, refactor, db-migration, myPreset
+```
+
+Exit 1. Never silently falls back to `default`.
+
+---
 
 ## Question
 

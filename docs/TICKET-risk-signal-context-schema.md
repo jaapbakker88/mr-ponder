@@ -3,6 +3,57 @@
 Type: **grilling + prototype**
 Blocked by: *(nothing — frontier)*
 Blocks: [Stage API Contract](TICKET-risk-stage-api-contract.md), [Git Signal Fetcher](TICKET-risk-git-signal-fetcher.md)
+**Status: RESOLVED**
+
+## Resolution
+
+Stage signature is `stage(chunk, ctx) → number` (separate args, not merged).
+Missing git signals are `null` (field present, value null — stages use `?? 0`).
+Runner calls `Object.freeze(ctx)` before invoking any stage.
+
+### `SignalContext` schema
+
+```typescript
+/** Pre-fetched signals passed frozen to every pipeline stage. */
+interface SignalContext {
+  // Fan-out (rg; shared files only)
+  fanOut: number;           // import count; 0 for non-shared or a real measured 0
+  fanOutFailed: boolean;    // true = rg could not assess (not a genuine 0)
+  importers: string[];      // repo-relative paths of importing files
+
+  // Sensitivity (path rules)
+  sensitivity: number;      // summed rule weight
+  sensLabels: string[];     // matched labels, e.g. ["auth", "money"]
+
+  // Path classification
+  shared: boolean;          // matches SHARED_RE
+  isTest: boolean;          // matches TEST_RE
+
+  // Git signals — null when repoDir is absent
+  churn: number | null;              // commit count in configured window
+  lastTouchedDaysAgo: number | null; // days since most recent commit
+  authorCount: number | null;        // distinct author email count
+  primaryAuthor: string | null;      // most-frequent author email
+}
+```
+
+### `Chunk` shape (read-only, first arg to every stage)
+
+```typescript
+interface Chunk {
+  id: string;        // "src/foo.ts@10:12"
+  file: string;      // repo-relative path
+  op: "renamed" | "deleted" | "added" | null;
+  context: string;   // enclosing fn/class from diff @@ header
+  oldStart: number;
+  newStart: number;
+  lines: string[];   // raw diff lines ("+"/"-"/" " prefixed)
+  added: number;
+  removed: number;
+}
+```
+
+---
 
 ## Question
 

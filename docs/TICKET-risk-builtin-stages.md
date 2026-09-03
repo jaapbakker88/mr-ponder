@@ -3,6 +3,66 @@
 Type: **grilling + prototype**
 Blocked by: [Stage API Contract](TICKET-risk-stage-api-contract.md), [Git Signal Fetcher](TICKET-risk-git-signal-fetcher.md)
 Blocks: [Preset Definitions](TICKET-risk-presets.md), [Migration Path](TICKET-risk-migration.md)
+**Status: RESOLVED**
+
+## Resolution
+
+All stages are separate (composable). Authorship models "few authors = higher risk".
+`sensitivity` reads pre-computed `ctx.sensitivity`.
+
+### Catalog
+
+Each stage is a factory `create(params) → (chunk, ctx) → number`. Params shown with defaults.
+
+| Name | Formula | Params | Notes |
+|---|---|---|---|
+| `sensitivity` | `ctx.sensitivity` | — | Reads pre-computed value; runner always computes this for display |
+| `fanOut` | `min(log10(fan+1) * multiplier, cap)` | `multiplier: 115`, `cap: 300` | Log-dampened reach; 0 for non-shared |
+| `churn` | `log10(ctx.churn+1) * weight` (null → 0) | `weight: 80`, `window: 90` | window passed to git fetcher |
+| `recency` | `ctx.lastTouchedDaysAgo >= staleDays ? weight : 0` (null → 0) | `weight: 60`, `staleDays: 180` | Step function: stale or not |
+| `authorship` | `weight / (ctx.authorCount + 1)` (null → 0) | `weight: 40` | More authors → lower delta |
+| `sharedBonus` | `chunk.shared ? bonus : 0` | `bonus: 50` | Shared-module nudge |
+| `unknownBonus` | `ctx.fanOutFailed ? bonus : 0` | `bonus: 75` | Fail-loud for unassessable reach |
+| `testSink` | `chunk.isTest ? -penalty : 0` | `penalty: 1000` | De-prioritise tests |
+| `metaOnlySink` | `chunk.metaOnly ? -penalty : 0` | `penalty: 900` | De-prioritise pure renames/deletes |
+| `sizeTiebreak` | `min(chunk.added + chunk.removed, cap) / divisor` | `cap: 100`, `divisor: 10` | Max +10; breaks score ties only |
+
+### Module locations
+
+```
+src/stages/
+  sensitivity.mjs
+  fanOut.mjs
+  churn.mjs
+  recency.mjs
+  authorship.mjs
+  sharedBonus.mjs
+  unknownBonus.mjs
+  testSink.mjs
+  metaOnlySink.mjs
+  sizeTiebreak.mjs
+```
+
+Each exports `default` (factory) and `meta` (name + params schema).
+
+### Default pipeline (reproduces current hardcoded formula, no new signals)
+
+```jsonc
+[
+  { "name": "sensitivity" },
+  { "name": "fanOut" },
+  { "name": "sharedBonus" },
+  { "name": "unknownBonus" },
+  { "name": "testSink" },
+  { "name": "metaOnlySink" },
+  { "name": "sizeTiebreak" }
+]
+```
+
+`churn`, `recency`, `authorship` are NOT in the default pipeline — they require
+`repoDir` and are opt-in via the `security`/`refactor` presets or explicit config.
+
+---
 
 ## Question
 

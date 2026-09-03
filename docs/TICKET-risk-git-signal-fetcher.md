@@ -3,6 +3,66 @@
 Type: **grilling + prototype**
 Blocked by: [Signal Context Schema](TICKET-risk-signal-context-schema.md)
 Blocks: [Built-in Stage Catalog](TICKET-risk-builtin-stages.md)
+**Status: RESOLVED**
+
+## Resolution
+
+Days-based churn window (default 90). Author identity by email. `--follow` enabled.
+
+### Single-pass fetch per file
+
+One `git log` invocation per file derives all three signals:
+
+```sh
+git log --follow --format="%ae%x00%at" --since=<90-days-ago> -- <path>
+# Each line: author-email NUL unix-timestamp
+# Derive:
+#   churn              = line count (number of commits in window)
+#   lastTouchedDaysAgo = (now - max(timestamp)) / 86400, rounded down
+#   authorCount        = distinct email count
+#   primaryAuthor      = most-frequent email (null if no commits)
+```
+
+`lastTouchedDaysAgo` uses the full history (no `--since`), so a stale file is
+detected even when churn in the window is 0. Two separate invocations:
+
+```sh
+# 1. Windowed (for churn + authorship)
+git log --follow --format="%ae%x00%at" --since=<windowDate> -- <path>
+
+# 2. Single most-recent commit (for lastTouchedDaysAgo)
+git log --follow --format="%at" -1 -- <path>
+```
+
+Both are run in parallel per file.
+
+### Caching
+
+Results cached in a `Map<filePath, Promise<GitSignals>>` keyed on the
+repo-relative path. Multiple chunks touching the same file share one fetch.
+Cache lives for the lifetime of one `mrp` run (no persistence).
+
+### Absent `repoDir`
+
+When `repoDir` is `null` the fetcher is skipped entirely. All four git fields
+(`churn`, `lastTouchedDaysAgo`, `authorCount`, `primaryAuthor`) are set to
+`null` in ctx. Stages use `?? 0` / `?? null` to handle gracefully.
+
+### Parallelism
+
+All files fetched in parallel (same pattern as the fan-out rg fetcher).
+`git log` is read-only and stateless; no risk of contention.
+
+### Config surface (consumed by the `churn` stage, not the fetcher itself)
+
+```jsonc
+{ "name": "churn", "window": 90 }  // window in days; default 90
+```
+
+The fetcher always uses the window declared in the active `churn` stage config,
+falling back to 90 if absent or if no `churn` stage is in the pipeline.
+
+---
 
 ## Question
 

@@ -33,12 +33,21 @@ Skills to call per ticket: grilling, domain-modeling.
 
 ## Decisions so far
 
-*(none yet — charting complete, no tickets resolved)*
+- [Signal Context Schema](TICKET-risk-signal-context-schema.md): stage sig is `(chunk, ctx) → number`; missing git signals are `null`; runner freezes ctx before calling stages.
+- [Config Schema](TICKET-risk-config-schema.md): one `config.json`; `sensitivity.json` is legacy fallback; `.mrp.json` at repo root for repo-level config (full replace); `pipeline` beats `preset` when both present.
+- [Stage API Contract](TICKET-risk-stage-api-contract.md): factory pattern `create(params) → (chunk, ctx) → number`; async allowed; failed stage = skip + warn (delta 0); ESM only.
+- [Git Signal Fetcher](TICKET-risk-git-signal-fetcher.md): single `git log --follow` pass per file; days-based churn window (default 90); author identity by email; parallel fetches; absent repoDir → all git signals null.
+- [CLI & Preset Activation](TICKET-risk-cli-activation.md): `--preset` flag + `MR_PRESET` env var; no `--pipeline` flag; unknown preset = hard error; `--list-presets` prints available presets with descriptions.
+- [Built-in Stage Catalog](TICKET-risk-builtin-stages.md): 10 separate named stages; authorship formula `weight/(authorCount+1)`; sensitivity reads ctx; churn/recency/authorship opt-in (not in default pipeline).
+- [Preset Definitions](TICKET-risk-presets.md): 4 self-contained presets (default/security/refactor/db-migration); pipeline-only, no rule overrides; git-signal stages degrade gracefully without repoDir.
+- [Migration Path](TICKET-risk-migration.md): new `src/pipeline.mjs`; `risk.mjs` becomes display helpers + re-export shim; two PRs (runner+default first, signals+presets second); parity test in PR 1; PR 2 tracked in [TICKET-risk-signals-and-presets.md](TICKET-risk-signals-and-presets.md).
 
 ## Not yet specified
 
-- Complexity signal (separate feature; will need its own wayfinder once the
-  pipeline foundation exists)
+- Complexity signal (separate feature; needs its own wayfinder once the pipeline
+  foundation exists)
+- PR 2 edge cases: git signal fetcher behaviour on shallow clones, very large
+  histories, binary files
 
 ## Out of scope
 

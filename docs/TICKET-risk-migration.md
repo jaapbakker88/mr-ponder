@@ -3,6 +3,69 @@
 Type: **grilling + prototype**
 Blocked by: [Built-in Stage Catalog](TICKET-risk-builtin-stages.md), [Config Schema](TICKET-risk-config-schema.md), [Preset Definitions](TICKET-risk-presets.md), [CLI & Preset Activation](TICKET-risk-cli-activation.md)
 Blocks: *(nothing — last ticket before implementation)*
+**Status: RESOLVED**
+
+## Resolution
+
+New `src/pipeline.mjs` for the runner. `sensitivity.json` read silently as fallback.
+Two PRs: runner + default pipeline first; new signals + presets second (tracked below).
+Numerical parity test required in PR 1.
+
+---
+
+### Module split
+
+| File | Responsibility after migration |
+|---|---|
+| `src/pipeline.mjs` | Pipeline runner, config loader, git signal fetcher, stage registry |
+| `src/risk.mjs` | Display helpers (`riskGlyph`, `riskColor`, `riskOrder`, `orderChunks`, sidebar math); re-exports `scoreChunks` from `pipeline.mjs` for backward compat |
+| `src/sensitivity.mjs` | Unchanged — still owns `loadRules` / `sensitivity()`; called by the `sensitivity` stage |
+| `src/stages/*.mjs` | One file per built-in stage (see Built-in Stage Catalog) |
+
+`scoreChunks` signature stays identical to today — callers (`mrp.mjs`) need no changes.
+
+### Config loading (in `pipeline.mjs`)
+
+```
+1. Look for .mrp.json in repo root (cwd / git root)
+2. If found → use it (full replace)
+3. Else → look for ~/.config/mrp/config.json
+4. If sensitivityRules absent in active config → silently read
+   ~/.config/mrp/sensitivity.json as fallback (legacy shim, never written)
+5. Resolve pipeline: --preset / MR_PRESET / "pipeline" / "preset" / default
+   (see CLI & Preset Activation ticket for precedence)
+```
+
+### PR 1 — runner + default pipeline (zero behaviour change)
+
+Scope:
+- `src/pipeline.mjs` with runner, config loader, stage registry
+- `src/stages/` with the 7 default-pipeline stages (sensitivity, fanOut,
+  sharedBonus, unknownBonus, testSink, metaOnlySink, sizeTiebreak)
+- Config loading + `--preset` / `MR_PRESET` / `--list-presets` CLI wiring
+- `src/risk.mjs` thinned to display helpers + `scoreChunks` re-export
+- **Numerical parity test**: fixture set of chunks scored by old formula and new
+  `default` pipeline; assert scores are identical
+
+PR 1 must not change any score for any user with no config file.
+
+### PR 2 — new signals + presets *(follow-up, must be tracked)*
+
+Scope:
+- `src/stages/churn.mjs`, `recency.mjs`, `authorship.mjs`
+- Git signal fetcher in `pipeline.mjs`
+- Built-in presets: `security`, `refactor`, `db-migration`
+- `--list-presets` output updated with new presets
+
+> **Follow-up ticket needed**: create `TICKET-risk-signals-and-presets.md` before
+> closing this branch, so PR 2 has a home and doesn't get lost.
+
+### `suggest.mjs` (`buildImportEdges`)
+
+Out of scope for this migration. It runs its own fan-out greps for the import
+graph panel and does not go through `scoreChunks`. Left untouched.
+
+---
 
 ## Question
 
