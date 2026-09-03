@@ -148,11 +148,11 @@ async function main() {
     const importEdges = await buildImportEdges(chunks, repoDir, diffByFile);
 
     const state = loadState(project, iid);
-  const { staleSha, orphaned, newIds } = reconcile(
+  const { staleSha, orphaned, newIds, changedCount } = reconcile(
     state,
     headSha,
     new Date().toISOString(),
-    chunks.map((c) => c.id),
+    chunks.map((c) => ({ id: c.id, contentHash: c.contentHash })),
   );
   saveState(state);
   spin.stop();
@@ -175,10 +175,15 @@ async function main() {
   }
 
   if (staleSha) {
+    const genuinelyNew = newIds.length - changedCount;
+    const deltaDesc = [
+      changedCount  ? `${changedCount} rewritten`   : "",
+      genuinelyNew  ? `${genuinelyNew} added/removed` : "",
+    ].filter(Boolean).join(", ") || "none";
     process.stdout.write(
       `\n⚠ this MR was updated since your last review (head SHA changed).\n` +
         `  ${orphaned.length} annotated chunk(s) no longer match the current diff.\n` +
-        `  ${newIds.length} new/changed chunk(s) since last review — press 'd' to review just the delta.\n` +
+        `  ${newIds.length} chunk(s) changed since last review (${deltaDesc}) — press 'd' to review just the delta.\n` +
         `  Your notes are preserved but may point at shifted lines.\n\n`,
     );
   }

@@ -3,8 +3,27 @@
 // A "chunk" here == one @@ hunk of one file, the same unit `git add -p` walks.
 // Each chunk gets a STABLE id (file + old/new start lines) so notes re-attach
 // correctly after a re-fetch, as long as the hunk didn't move.
+// Each chunk also carries a contentHash (FNV-1a 32-bit of the normalised body)
+// so a force-push that rewrites content without shifting line numbers is caught.
 
 const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
+
+// FNV-1a 32-bit hash — dependency-free, fast enough for change detection.
+// Not cryptographic; purpose is equality comparison across re-fetches.
+export function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+// Hash the body lines of a chunk, normalising line endings so CRLF<->LF changes
+// don't produce spurious deltas.
+function hashBody(bodyLines) {
+  return fnv1a(bodyLines.join("\n").replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
+}
 
 // Split one file's `diff` string into hunk objects.
 export function parseFileHunks(file) {
@@ -26,7 +45,10 @@ export function parseFileHunks(file) {
   for (const line of lines) {
     const m = line.match(HUNK_RE);
     if (m) {
-      if (current) hunks.push(current);
+      if (current) {
+        current.contentHash = hashBody(current.body);
+        hunks.push(current);
+      }
       const oldStart = parseInt(m[1], 10);
       const oldCount = m[2] ? parseInt(m[2], 10) : 1;
       const newStart = parseInt(m[3], 10);
@@ -57,7 +79,10 @@ export function parseFileHunks(file) {
     // lines before the first @@ (the ---/+++ file header) are dropped: the
     // file path is already captured on each hunk.
   }
-  if (current) hunks.push(current);
+  if (current) {
+    current.contentHash = hashBody(current.body);
+    hunks.push(current);
+  }
 
   // No @@ hunks emitted. Two sub-cases, both represented as one synthetic chunk
   // so the file still shows up in the walk instead of silently vanishing:
@@ -72,6 +97,7 @@ export function parseFileHunks(file) {
       : op === "deleted" ? "file deleted"
       : op === "added" ? "file added"
       : "";
+    const body = raw.trim() ? lines : [`@@ ${path} @@`, summary || "(no content change)"];
     hunks.push({
       id: `${path}@0:0`,
       file: path,
@@ -83,13 +109,14 @@ export function parseFileHunks(file) {
       newCount: 0,
       // For a metadata-only op there's no diff text — seed the body with a
       // one-line human summary so the hunk pane isn't blank.
-      body: raw.trim() ? lines : [`@@ ${path} @@`, summary || "(no content change)"],
+      body,
       added: (raw.match(/^\+/gm) || []).length,
       removed: (raw.match(/^-/gm) || []).length,
       newFile,
       deletedFile,
       renamedFile,
       op,
+      contentHash: hashBody(body),
     });
   }
   return hunks;

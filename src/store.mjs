@@ -50,44 +50,71 @@ export function saveState(state) {
   writeFileSync(p, JSON.stringify(state, null, 2));
 }
 
-// Reconcile persisted state with a freshly-fetched revision. If the head SHA
-// changed, keep the annotations but record that they predate this revision so
-// the UI can flag chunks whose id no longer exists in the new diff.
 // Reconcile persisted state with a freshly-fetched revision.
-//   - staleSha: the MR head moved since last review (force-push / new commits).
-//   - orphaned: annotated chunk ids absent from the new diff (notes may drift).
-//   - newIds:   chunk ids present now but NOT in the last reviewed revision — the
-//               DELTA to focus a re-review on. Empty on a first review (nothing to
-//               compare against) so the whole MR reads as "new" only implicitly.
-// The set of chunk ids at the reviewed revision is persisted as reviewedChunkIds
-// so the next re-review diffs against THIS pass, not the original.
-export function reconcile(state, headSha, fetchedAt, chunkIds) {
+//   - staleSha:    the MR head moved since last review (force-push / new commits).
+//   - orphaned:    annotated chunk ids absent from the new diff OR present but with
+//                  a different contentHash (annotations now point at different code).
+//   - newIds:      chunks present now but NOT in the last reviewed revision, OR
+//                  present with a different contentHash — the delta to re-review.
+//   - changedCount: subset of newIds whose id existed before but hash changed.
+//
+// 4th parameter: array of { id, contentHash } objects.
+// Migration: old state carries reviewedChunkIds (string[]) but no reviewedChunks.
+//   First run after upgrade uses id-only comparison; full hash detection starts
+//   from the second run once reviewedChunks has been written.
+export function reconcile(state, headSha, fetchedAt, chunks) {
   const staleSha = !!state.headSha && state.headSha !== headSha;
-  const idSet = new Set(chunkIds);
 
-  // Delta vs the previously-reviewed revision (only meaningful once we've stored
-  // a prior set — i.e. this isn't the first-ever review).
-  const prevReviewed = state.reviewedChunkIds || null;
+  // Snapshot the PREVIOUS stored hashes before mutating state.
+  const prevChunks = state.reviewedChunks || null;   // { [id]: hash } | null
+  const prevIds    = state.reviewedChunkIds || null;  // string[] | null (legacy)
+
+  // Build id→hash map for this revision.
+  const incoming = new Map(chunks.map((c) => [c.id, c.contentHash]));
+
+  // --- Delta: which chunks are new or content-changed? ---
   const newIds = [];
-  if (prevReviewed) {
-    const prevSet = new Set(prevReviewed);
-    for (const id of chunkIds) if (!prevSet.has(id)) newIds.push(id);
+  let changedCount = 0;
+
+  if (prevChunks) {
+    for (const [id, hash] of incoming) {
+      if (!(id in prevChunks)) {
+        newIds.push(id);                         // new id
+      } else if (prevChunks[id] !== hash) {
+        newIds.push(id);                         // same id, different content
+        changedCount++;
+      }
+    }
+  } else if (prevIds) {
+    // Legacy: no stored hash — id-only comparison.
+    const prevSet = new Set(prevIds);
+    for (const [id] of incoming) if (!prevSet.has(id)) newIds.push(id);
   }
+  // No previous state → first review; newIds empty (whole MR new implicitly).
 
-  state.headSha = headSha;
-  state.fetchedAt = fetchedAt;
-  state.reviewedChunkIds = chunkIds; // remember this revision's shape
-
-  // Chunks that carry annotations but are absent from the new diff = orphaned.
-  const orphaned = [];
+  // --- Orphaned: annotated chunks gone OR content-changed ---
   const annotated = new Set([
     ...Object.keys(state.notes),
     ...Object.keys(state.tags),
     ...Object.keys(state.seen),
     ...Object.keys(state.engaged || {}),
   ]);
-  for (const id of annotated) if (!idSet.has(id)) orphaned.push(id);
-  return { staleSha, orphaned, newIds };
+  const orphaned = [];
+  for (const id of annotated) {
+    if (!incoming.has(id)) {
+      orphaned.push(id); // absent from new diff entirely
+    } else if (prevChunks && id in prevChunks && prevChunks[id] !== incoming.get(id)) {
+      orphaned.push(id); // content changed — prior annotation points at different code
+    }
+  }
+
+  // --- Persist this revision as the new delta base ---
+  state.headSha = headSha;
+  state.fetchedAt = fetchedAt;
+  state.reviewedChunks  = Object.fromEntries(incoming);  // new field
+  state.reviewedChunkIds = [...incoming.keys()];          // keep for back-compat
+
+  return { staleSha, orphaned, newIds, changedCount };
 }
 
 // ---- mutation helpers (each returns the mutated state; caller saves) ----

@@ -182,6 +182,15 @@ increment. Note: this is delta-by-chunk-identity (`file@oldStart:newStart`), not
 diff-of-diffs — a chunk whose *content* changed but whose start lines held is not yet
 flagged. Good enough for the common force-push case; true content-delta is a follow-up.
 
+**Implementation note (2026-09-03):** The content-delta follow-up is now shipped.
+`diff.mjs` computes a `contentHash` (FNV-1a 32-bit, CRLF-normalised) for every chunk
+body. `reconcile` now accepts `{ id, contentHash }[]` and persists `reviewedChunks`
+(`{ [id]: hash }`). Delta logic: id absent → new; id present + hash differs → new AND
+orphaned (prior annotations point at different code). The stale-SHA notice now reports
+rewritten vs added/removed counts. Migration: old state files carry `reviewedChunkIds`
+only; first run after upgrade uses id-only comparison and writes `reviewedChunks`,
+giving full hash detection from the second run onward.
+
 ## No triage layer above a single MR (the mrs seam)
 
 **Observation:** `mrp` opens one MR by `iid` that the reviewer already chose. It is

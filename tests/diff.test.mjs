@@ -142,3 +142,57 @@ test("parseChanges flattens files in order", () => {
   assert.equal(chunks.length, 3);
   assert.deepEqual(chunks.map((c) => c.file), ["a.ts", "b.ts", "b.ts"]);
 });
+
+// ---- fnv1a + contentHash tests ----
+import { fnv1a } from "../src/diff.mjs";
+
+test("fnv1a: same input → same hash", () => {
+  assert.equal(fnv1a("hello"), fnv1a("hello"));
+});
+
+test("fnv1a: one char change → different hash", () => {
+  assert.notEqual(fnv1a("hello"), fnv1a("hellx"));
+});
+
+test("fnv1a: empty string → stable value", () => {
+  assert.equal(typeof fnv1a(""), "string");
+  assert.equal(fnv1a("").length, 8); // 8 hex chars
+});
+
+test("parseFileHunks attaches contentHash to every chunk", () => {
+  const file = {
+    new_path: "src/foo.ts",
+    diff: "@@ -1,3 +1,3 @@\n context\n-old line\n+new line\n",
+  };
+  const [chunk] = parseFileHunks(file);
+  assert.ok(chunk.contentHash, "contentHash should be set");
+  assert.equal(typeof chunk.contentHash, "string");
+  assert.equal(chunk.contentHash.length, 8);
+});
+
+test("contentHash changes when body content changes", () => {
+  const make = (line) => ({
+    new_path: "src/foo.ts",
+    diff: `@@ -1,2 +1,2 @@\n context\n-old\n+${line}\n`,
+  });
+  const h1 = parseFileHunks(make("alpha"))[0].contentHash;
+  const h2 = parseFileHunks(make("beta"))[0].contentHash;
+  assert.notEqual(h1, h2);
+});
+
+test("contentHash is stable across re-fetches with identical content", () => {
+  const file = { new_path: "a.ts", diff: "@@ -1 +1 @@\n+line\n" };
+  assert.equal(parseFileHunks(file)[0].contentHash, parseFileHunks(file)[0].contentHash);
+});
+
+test("contentHash normalises CRLF to LF (no spurious delta)", () => {
+  const lf   = { new_path: "a.ts", diff: "@@ -1 +1 @@\n+line\n" };
+  const crlf = { new_path: "a.ts", diff: "@@ -1 +1 @@\r\n+line\r\n" };
+  assert.equal(parseFileHunks(lf)[0].contentHash, parseFileHunks(crlf)[0].contentHash);
+});
+
+test("synthetic chunk (no @@ header) also has contentHash", () => {
+  const file = { new_path: "img.png", diff: "", new_file: true };
+  const [chunk] = parseFileHunks(file);
+  assert.ok(chunk.contentHash);
+});
