@@ -38,8 +38,24 @@ export const DEFAULT_RULES = [
 
 let cached = null; // { rules: [{re, weight, label}] }
 
-// Compile rules from config (or defaults). Bad regexes are skipped with a warning
-// rather than crashing the walk — a typo in one org rule shouldn't blind the tool.
+// Compile an array of raw rule objects into [{re, weight, label}]. Bad regexes are
+// skipped with a warning rather than crashing the walk — a typo in one org rule
+// shouldn't blind the tool. Called by loadRules() and by pipeline.mjs when the
+// active config supplies its own sensitivityRules array.
+export function compileRules(raw) {
+  const rules = [];
+  for (const r of raw) {
+    if (!r || typeof r.pattern !== "string") continue;
+    try {
+      rules.push({ re: new RegExp(r.pattern, "i"), weight: Number(r.weight) || 0, label: String(r.label || "sensitive") });
+    } catch {
+      process.stderr.write(`mrp: skipping invalid sensitivity pattern: ${r.pattern}\n`);
+    }
+  }
+  return rules;
+}
+
+// Load (and cache) rules from config file or defaults.
 export function loadRules(forceReload = false) {
   if (cached && !forceReload) return cached.rules;
   let raw = DEFAULT_RULES;
@@ -52,15 +68,7 @@ export function loadRules(forceReload = false) {
       process.stderr.write(`mrp: ignoring malformed ${p}\n`);
     }
   }
-  const rules = [];
-  for (const r of raw) {
-    if (!r || typeof r.pattern !== "string") continue;
-    try {
-      rules.push({ re: new RegExp(r.pattern, "i"), weight: Number(r.weight) || 0, label: String(r.label || "sensitive") });
-    } catch {
-      process.stderr.write(`mrp: skipping invalid sensitivity pattern: ${r.pattern}\n`);
-    }
-  }
+  const rules = compileRules(raw);
   cached = { rules };
   return rules;
 }

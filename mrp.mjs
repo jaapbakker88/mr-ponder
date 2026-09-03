@@ -54,6 +54,18 @@ const opt = (n, d) => {
   return i >= 0 && args[i + 1] ? args[i + 1] : d;
 };
 
+// --list-presets: print available presets and exit (no MR number required).
+if (flag("--list-presets")) {
+  const { listPresets } = await import("./src/pipeline.mjs");
+  listPresets(process.env.MR_REPO_DIR ?? process.cwd());
+  process.exit(0);
+}
+
+// --preset <name>: activate a named preset.  Write it to the env var that the
+// pipeline runner already reads; this keeps scoreChunks(chunks, repoDir) unchanged.
+const presetFlag = opt("--preset", null);
+if (presetFlag) process.env.MR_PRESET = presetFlag;
+
 const iid = args.find((a) => /^\d+$/.test(a));
 if (!iid) {
   console.error("usage: mrp <mr-iid> [--project a/b/c] [--refetch] [--export [--format json|md] [--all] [--out PATH]]");
