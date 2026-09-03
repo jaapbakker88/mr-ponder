@@ -1,7 +1,9 @@
 # BUG: sidebar corrupts below the cursor in file order (large MRs)
 
 **Status:** RESOLVED. Root cause confirmed via raw-ANSI capture; fix applied
-and verified on WezTerm/Windows against the reference MR by the reporter.
+and verified on WezTerm/Windows against a large internal MR by the reporter.
+(Original repro details redacted — the MR number, project path, and component
+names were from a private repo.)
 
 ## Resolution
 
@@ -55,8 +57,8 @@ sidebar windowing block right after `computeSidebarWindow`.
 **Ruled out along the way, with hard evidence (not assumption), before
 finding the actual cause:**
 - Raw control characters (ESC, TAB, etc.) leaking from diff content into
-  labels — scanned all 142 real chunks' `context` and `body` from the reference MR:
-  zero.
+  labels — scanned all 142 real chunks' `context` and `body` from the
+  reference MR: zero.
 - Unbalanced inverse SGR (`\x1b[7m` without a matching off) bleeding across
   a line break — scanned the full raw ANSI capture: zero occurrences.
 - Any rendered line's visible width exceeding the terminal's column count
@@ -67,8 +69,9 @@ finding the actual cause:**
 
 ## Original report (kept for history)
 
-Running against a large MR (reproduces reliably on **the reference MR**), in **file
-order** (`o`), scroll down until the cursor is well into the list. Observed:
+Running against a large MR (reproduces reliably on **one large internal
+MR**, ~142 chunks), in **file order** (`o`), scroll down until the cursor is
+well into the list. Observed:
 
 - The **highlighted (current) row is the last row that renders correctly.**
 - **Everything below the cursor is garbage**: file-header rows appear back-to-back
@@ -77,10 +80,9 @@ order** (`o`), scroll down until the cursor is well into the list. Observed:
 - Everything **at and above** the cursor looks fine.
 
 Screenshot evidence (user's, WezTerm/Windows): a cropped sidebar showing e.g.
-`<Section>` header immediately followed by
-`<TableDefinition>` header with the Receivables **chunk row
-missing** between them. Colors (new sidebar color-coding) are present, so the
-screenshot IS the current build.
+a section header immediately followed by a table-definition header with the
+section's **chunk row missing** between them. Colors (new sidebar color-coding)
+are present, so the screenshot IS the current build.
 
 ## Environment
 
@@ -94,12 +96,12 @@ screenshot IS the current build.
 
 ## What is PROVEN correct (do not re-investigate these)
 
-1. **Chunk ids are unique.** the reference MR: 142 chunks, 142 distinct ids. No React key
-   collisions from duplicate ids.
+1. **Chunk ids are unique.** The reference MR: 142 chunks, 142 distinct ids. No
+   React key collisions from duplicate ids.
 2. **The row model (`allRows`) is correct and stable.** Reproduced headless with
-   real <iid> data: every file header is immediately followed by its own chunk
-   rows; grouping is contiguous; `orderChunks(chunks,"file")` is stable across
-   calls. See the repro approach in the "Repro harness" section.
+   real reference data: every file header is immediately followed by its own
+   chunk rows; grouping is contiguous; `orderChunks(chunks,"file")` is stable
+   across calls. See the repro approach in the "Repro harness" section.
 3. **The windowing math is correct.** `sidebarRowIndex` + `computeSidebarWindow`
    (pure, in `src/risk.mjs`, unit-tested in `tests/risk.test.mjs`) always return a
    window containing the current chunk's row, at every cursor position, and
@@ -107,7 +109,7 @@ screenshot IS the current build.
    cover this.
 
 Conclusion: the data/model/window are right. **The corruption is in the terminal
-render layer** (Ink painting the wrong thing), and it is terminal-specific
+render layer** (Ink painting the wrong thing), and it's terminal-specific
 (never reproduced in headless `ink` renders piped through `sed`).
 
 ## Fixes ATTEMPTED that did NOT work (do not repeat)
@@ -190,12 +192,12 @@ if (process.env.MRP_DEBUG) {
 ```
 
 Then have the user run: `MRP_DEBUG=/tmp/mrp.log mrp <iid>`, press `o`, scroll into
-<Feature> until it breaks, `q`. Read `/tmp/mrp.log`. This tells you what
+the large files until it breaks, `q`. Read `/tmp/mrp.log`. This tells you what
 the MODEL fed Ink (expected: correct) vs what the screen SHOWS (corrupt) — proving
 it's Ink's paint, and pinning the exact frame.
 
-NOTE: env vars must reach the process. `mrp` is a symlink to
-`~/work/mr-ponder/mrp.mjs`; `MRP_DEBUG=... mrp <iid>` should pass through, but
+NOTE: env vars must reach the process. If `mrp` is a symlink to the
+`mrp.mjs` script, `MRP_DEBUG=... mrp <iid>` should pass through, but
 verify the file is created (a prior attempt produced no log — likely the ESM
 `require()` threw and was swallowed; the static import above avoids that).
 
@@ -228,7 +230,7 @@ const visible = orderChunks(chunks, "file");
 
 ## Acceptance
 
-In WezTerm on Windows, `mrp <iid>` → `o` → scroll through all
-<Feature> files: every file header is followed by its own chunk
-rows, the cursor row and all rows below it render correctly, no chunk appears
-under the wrong file, no header appears without its chunks.
+In WezTerm on Windows, `mrp <iid>` → `o` → scroll through all the large
+files: every file header is followed by its own chunk rows, the cursor row
+and all rows below it render correctly, no chunk appears under the wrong
+file, no header appears without its chunks.

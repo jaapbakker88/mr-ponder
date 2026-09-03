@@ -472,7 +472,7 @@ export default function App({ initialState, chunks, detail, importEdges, forge }
   // bottomVisible — same double-commit problem as the lineCur/selAnchor reset
   // above, but INDEPENDENT of it: fixing that one didn't fix this one, which is
   // why the render count didn't actually drop (verified via MRP_DEBUG: still 2
-  // renders/keystroke). Most of the the reference MR <Feature> chunks are
+  // renders/keystroke). Most of the reference MR's large-file chunks are
   // tiny single-hunk adds, so `bottomVisible` is true immediately on landing —
   // this effect fired on nearly every keystroke through that whole region.
   // Marking engaged during render (same pattern as above) folds the state
