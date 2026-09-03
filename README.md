@@ -156,6 +156,10 @@ See `docs/SPEC-promote-and-export.md` for the promote/export design.
 
 ## Known gaps / next
 
+See `docs/IDEAS.md` for the roadmap — language-agnostic risk scoring (profiles,
+import graph), plus open specs and tickets in `docs/` that can be tackled one at
+a time.
+
 - Keyboard/visual behavior is verified by tests + boot, but the interactive *feel*
   needs a real TTY — Ink can't be driven headlessly.
 - Sensitivity weights and the "engaged" bar are first calibrations — tune against
