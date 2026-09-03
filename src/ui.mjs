@@ -350,6 +350,9 @@ export default function App({ initialState, chunks, detail, importEdges, forge }
     return matches;
   }, [visible, pattern]);
 
+  const safeIdx = Math.min(idx, Math.max(0, visible.length - 1));
+  const chunk = visible[safeIdx];
+
   // Stats exposed for the search status panel (see TICKET-grilling-search-status-panel).
   // flatTotal / flatIdx: global position in the match list.
   // matchesInChunk / chunkMatchIdx: position within the current chunk's matches.
@@ -358,9 +361,6 @@ export default function App({ initialState, chunks, detail, importEdges, forge }
   const chunkMatchIdx = (flatMatches[flatMatchIdx]?.chunkIdx === safeIdx)
     ? flatMatches.filter((_, i) => flatMatches[i].chunkIdx === safeIdx && i < flatMatchIdx).length
     : 0;
-
-  const safeIdx = Math.min(idx, Math.max(0, visible.length - 1));
-  const chunk = visible[safeIdx];
 
   // Keep the stored index in sync with what's actually rendered: when a filter
   // shrinks `visible`, `idx` can point past the end. `safeIdx` clamps it for
