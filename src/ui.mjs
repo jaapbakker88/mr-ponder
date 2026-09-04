@@ -215,7 +215,7 @@ function fmtRange(r) {
   return r.start === r.end ? ` L${r.start}` : ` L${r.start}-${r.end}`;
 }
 
-export default function App({ initialState, chunks, detail, importEdges, forge }) {
+export default function App({ initialState, chunks, detail, importEdges, intraEdges, forge }) {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const [state, setState] = useState(initialState);
@@ -330,7 +330,7 @@ export default function App({ initialState, chunks, detail, importEdges, forge }
     // CRITICAL: navigation walks `visible` in array order, and the sidebar renders
     // `visible` in the same order — they must agree or the cursor "teleports".
     // orderChunks encapsulates the risk-vs-file ordering (see risk.mjs).
-    return orderChunks(list, orderMode);
+    return orderChunks(list, orderMode, { intraEdges });
   }, [chunks, state, unseenOnly, sharedOnly, deltaOnly, testFilter, filter, orderMode, pattern]);
 
   // Flat list of every pattern-matching line across all visible chunks.
@@ -831,9 +831,16 @@ export default function App({ initialState, chunks, detail, importEdges, forge }
       setIdx(0); setScroll(0);
     }
     else if (lc === "o") {
+      const NEXT_MODE = { risk: "file", file: "deps", deps: "risk" };
+      const hasDepEdges = intraEdges && [...intraEdges.values()].some((s) => s.size > 0);
+      const NEXT_MSG = {
+        risk: "order: file (grouped, read in place)",
+        file: hasDepEdges ? "order: deps (dependency order)" : "order: deps (no edges — file order)",
+        deps: "order: risk (highest-consequence first)",
+      };
       orderAnchor.current = chunk?.id ?? null;
-      setOrderMode((m) => (m === "risk" ? "file" : "risk"));
-      flashMsg(orderMode === "risk" ? "order: file (grouped, read in place)" : "order: risk (highest-consequence first)");
+      setOrderMode((m) => NEXT_MODE[m] ?? "file");
+      flashMsg(NEXT_MSG[orderMode]);
     }
     // i — toggle the importers panel: WHO imports the current chunk's shared file
     // (the blast radius behind the fan-out count). Only meaningful for shared files.
@@ -876,7 +883,7 @@ export default function App({ initialState, chunks, detail, importEdges, forge }
            h(Text, null, "  z          undo last note/tag/link/ack"),
           h(Text, null, "  / u s d e  / find (file · context · notes · tags · body) / unseen / shared / delta / tests"),
           h(Text, null, "  \\          pattern search over hunk bodies with highlighting (regex; Esc=clear)"),
-          h(Text, null, "  o          toggle order: risk (consequence-first) ↔ file (grouped, read in place)"),
+          h(Text, null, "  o          cycle order: risk (consequence-first) → file (grouped) → deps (dependency order)"),
           h(Text, null, "  i          importers: list the files that import this shared file (blast radius)"),
           h(Text, null, "  ? ! q      help / MR-updated warning / quit"),
           h(Text, { dimColor: true }, "state saves automatically · press ? or Esc to return")))

@@ -84,15 +84,20 @@ export function parseFileHunks(file) {
     hunks.push(current);
   }
 
-  // No @@ hunks emitted. Two sub-cases, both represented as one synthetic chunk
+  // No @@ hunks emitted. Three sub-cases, all represented as one synthetic chunk
   // so the file still shows up in the walk instead of silently vanishing:
   //   1. raw content but no @@ header (binary, or a whole-file add/delete blob)
   //   2. a metadata-only op (pure rename, or a rename/mode change with an empty
   //      diff) — previously dropped entirely, so the reviewer never saw it.
-  if (!hunks.length && (raw.trim() || op)) {
+  //   3. diff was collapsed by the forge API (file.collapsed === true) — show a
+  //      placeholder so the file is visible; /diffs fixes the root cause, but
+  //      this guard prevents silent loss if collapsing ever recurs.
+  const collapsed = !!file.collapsed;
+  if (!hunks.length && (raw.trim() || op || collapsed)) {
     const oldPath = file.old_path && file.old_path !== path ? file.old_path : null;
     const summary =
-      op === "renamed" && oldPath ? `renamed from ${oldPath}`
+      collapsed ? "diff collapsed by forge API (run --refetch to reload)"
+      : op === "renamed" && oldPath ? `renamed from ${oldPath}`
       : op === "renamed" ? "renamed"
       : op === "deleted" ? "file deleted"
       : op === "added" ? "file added"

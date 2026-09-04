@@ -23,6 +23,7 @@ import { promisify } from "node:util";
 import { parseChanges } from "./src/diff.mjs";
 import { scoreChunks, riskOrder } from "./src/risk.mjs";
 import { buildImportEdges } from "./src/suggest.mjs";
+import { buildIntraEdges } from "./src/depssort.mjs";
 import { loadState, saveState, reconcile } from "./src/store.mjs";
 import { buildExport, toMarkdown } from "./src/export.mjs";
 import { writeFileSync } from "node:fs";
@@ -145,7 +146,10 @@ async function main() {
     const diffByFile = new Map(
       changes.map((f) => [f.new_path || f.old_path, f.diff || ""]),
     );
-    const importEdges = await buildImportEdges(chunks, repoDir, diffByFile);
+    const [importEdges, intraEdges] = await Promise.all([
+      buildImportEdges(chunks, repoDir, diffByFile),
+      buildIntraEdges(chunks, repoDir, diffByFile).catch(() => new Map()),
+    ]);
 
     const state = loadState(project, iid);
   const { staleSha, orphaned, newIds, changedCount } = reconcile(
@@ -218,7 +222,7 @@ async function main() {
   }
 
   const app = render(
-    React.createElement(App, { initialState: state, chunks, detail: uiDetail, importEdges, forge: forgeAdapter }),
+    React.createElement(App, { initialState: state, chunks, detail: uiDetail, importEdges, intraEdges, forge: forgeAdapter }),
     );
   try {
     await app.waitUntilExit();

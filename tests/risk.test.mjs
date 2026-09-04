@@ -177,6 +177,44 @@ test("orderChunks file mode keeps all chunks (no loss)", () => {
   assert.deepEqual([...out.map((c) => c.id)].sort(), ["a", "b", "c"]);
 });
 
+// ---- orderChunks deps mode ----
+
+test("orderChunks deps mode: topological order via intraEdges", () => {
+  const chunks = [
+    { id: "page",    file: "app/src/features/x/page.tsx",    newStart: 1 },
+    { id: "service", file: "app/src/features/x/service.ts",  newStart: 1 },
+    { id: "types",   file: "app/src/features/x/types.ts",    newStart: 1 },
+  ];
+  const intraEdges = new Map([
+    ["app/src/features/x/page.tsx",   new Set(["app/src/features/x/service.ts"])],
+    ["app/src/features/x/service.ts", new Set(["app/src/features/x/types.ts"])],
+    ["app/src/features/x/types.ts",   new Set()],
+  ]);
+  const out = orderChunks(chunks, "deps", { intraEdges });
+  assert.deepEqual(out.map((c) => c.id), ["types", "service", "page"]);
+});
+
+test("orderChunks deps mode: falls back to file order when no edges", () => {
+  const chunks = [
+    { id: "z5", file: "z.ts", newStart: 5 },
+    { id: "a1", file: "a.ts", newStart: 1 },
+    { id: "z1", file: "z.ts", newStart: 1 },
+  ];
+  const intraEdges = new Map([["z.ts", new Set()], ["a.ts", new Set()]]);
+  const out = orderChunks(chunks, "deps", { intraEdges });
+  assert.deepEqual(out.map((c) => c.id), ["z1", "z5", "a1"]);
+});
+
+test("orderChunks deps mode: falls back to file order when intraEdges absent", () => {
+  const chunks = [
+    { id: "z5", file: "z.ts", newStart: 5 },
+    { id: "a1", file: "a.ts", newStart: 1 },
+    { id: "z1", file: "z.ts", newStart: 1 },
+  ];
+  const out = orderChunks(chunks, "deps");
+  assert.deepEqual(out.map((c) => c.id), ["z1", "z5", "a1"]);
+});
+
 // ---- sidebar windowing (file-order highlight-alignment regression) ----
 // Bug: in file order, header rows shared the same id as their first chunk, so the
 // "where is the cursor" lookup matched the HEADER row, mis-centering the scroll

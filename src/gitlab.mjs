@@ -49,10 +49,14 @@ export async function fetchMrDetail(project, iid) {
 }
 
 // The changed files with unified diffs (already delimited into @@ hunks).
+// Uses /diffs (not /changes): /changes collapses large-but-not-too_large diffs
+// (collapsed:true, empty diff string), silently dropping them from the review.
+// /diffs returns the full content for those files.
 export async function fetchMrChanges(project, iid) {
   const P = enc(project);
-  const d = await api(`projects/${P}/merge_requests/${iid}/changes?per_page=100`);
-  return d.changes || [];
+  const d = await api(`projects/${P}/merge_requests/${iid}/diffs?per_page=100`);
+  // /diffs returns an array directly; /changes wraps in { changes: [] }.
+  return Array.isArray(d) ? d : (d.changes || []);
 }
 
 // Build a GitLab diff-note "position" for a chunk (A1 coarse anchoring: attach at

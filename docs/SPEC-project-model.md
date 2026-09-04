@@ -1,7 +1,7 @@
 # Spec: project model — language-agnostic risk scoring
 
 **Status:** OPEN · **Priority:** P0 (prerequisite for all language work) · **Drafted:** 2026-09-02
-**From:** `docs/IDEAS.md` §2 · **Blocks:** go/python profiles, `SPEC-import-graph.md` step 3+
+**From:** `docs/IDEAS.md` §2 · **Blocks:** go/python profiles, `SPEC-import-graph.md` step 3+, `SPEC-deps-sort.md` step 4
 
 ## Problem
 
@@ -145,6 +145,8 @@ makes `generic` safe.
 - `go`/`python`/`rust` profile *contents* — separate specs once the seam lands.
 - Import-graph builder — `SPEC-import-graph.md`.
 - Tree-sitter — deferred (see `docs/IDEAS.md` §8).
+- Dependency-order sort — `SPEC-deps-sort.md` (uses `profile.importsOf`; ships
+  against the hardcoded `node-ts` extractor until this spec's step 4 lands).
 
 ## Sequencing
 
