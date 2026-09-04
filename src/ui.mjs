@@ -410,6 +410,18 @@ export default function App({ initialState, chunks, detail, importEdges, intraEd
     return groups;
   }, [visible]);
 
+  // In deps mode: for each file, how many other MR files import it (← count).
+  // Computed once from intraEdges so the header annotation is O(1) per group.
+  const intraImportedBy = useMemo(() => {
+    const m = new Map();
+    if (intraEdges) {
+      for (const [, deps] of intraEdges) {
+        for (const dep of deps) m.set(dep, (m.get(dep) ?? 0) + 1);
+      }
+    }
+    return m;
+  }, [intraEdges]);
+
   const jumpFile = (dir) => {
     if (!chunk) return;
     const fi = fileGroups.findIndex((g) => g.file === chunk.file);
@@ -978,10 +990,14 @@ export default function App({ initialState, chunks, detail, importEdges, intraEd
       // chunk) only so the scroll window can keep a header on screen with its
       // children. They must never match the current-chunk lookup (which keys on
       // `chunkId`), or the window would center one row above the real selection.
+      const depsBadge = orderMode === "deps" && intraEdges
+        ? ` →${intraEdges.get(g.file)?.size ?? 0} ←${intraImportedBy.get(g.file) ?? 0}`
+        : "";
       allRows.push({ key: `f-${g.file}`, headerFor: g.chunks[0]?.id, el:
         h(Text, { key: `f-${g.file}`, bold: true, wrap: "truncate" },
           headGlyph === " " ? "  " : h(Text, { color: riskColor(agg) }, `${headGlyph} `),
-          short.slice(0, Math.max(4, sidebarInner - 2))) });
+          short.slice(0, Math.max(4, sidebarInner - 2 - depsBadge.length)),
+          depsBadge ? h(Text, { dimColor: true }, depsBadge) : null) });
       g.chunks.forEach((c, ci) => {
         const isCur = chunk && c.id === chunk.id;
         const seen = !isCur && state.seen[c.id];
